@@ -1,0 +1,93 @@
+# Main inputs
+csv_path: "/Users/kashewknutt/Projects/imagegen/1.csv"
+images_dir: "/Users/kashewknutt/Projects/imagegen/pics_raw"
+# input_mode: "csv" (use csv_path) or "folder" (use images_dir only)
+input_mode: "xlsx"
+xlsx_path: "Stock.xlsx"
+# Which sheet(s) to read. Default uses the consolidated sheet.
+xlsx_sheets: ["Total"]
+
+# Optional: allow downloading a reference image from the CSV when local lookup fails.
+allow_url_fallback: true
+download_cache_dir: "outputs/_download_cache"
+
+# Outputs / progress
+outputs_dir: "outputs"
+state_path: "outputs/state.json"
+missing_images_report: "outputs/missing_local_images.csv"
+cost_log_csv: "outputs/cost_log.csv"
+
+# Google model
+# "nanobanana" in this project maps to Gemini image generation models.
+# Gemini 3 image models (preview) per Vertex AI docs:
+# - gemini-3.1-flash-image-preview
+# Stable option:
+# - gemini-2.5-flash-image
+model: "models/gemini-2.5-flash-image"
+
+# Optional: pricing table for estimated costs (USD). Leave empty to log tokens only.
+# Values are per 1M tokens.
+pricing_usd_per_million_tokens:
+  # Gemini 3.1 Flash Image Preview (Nano Banana 2)
+  # Input: $0.50 / 1M tokens (text/image)
+  # Output: $3 / 1M tokens (text+thinking), $60 / 1M tokens (images)
+  models/gemini-3.1-flash-image-preview:
+    input_text: 0.50
+    input_image: 0.50
+    output_text: 3.00
+    output_image: 60.00
+
+  # Gemini 3 Pro Image Preview (Nano Banana Pro)
+  # Input: $2.00 / 1M tokens (text/image)
+  # Output: $12 / 1M tokens (text+thinking), $120 / 1M tokens (images)
+  models/gemini-3-pro-image-preview:
+    input_text: 2.00
+    input_image: 2.00
+    output_text: 12.00
+    output_image: 120.00
+
+  # Gemini 2.5 Flash Image (Nano Banana)
+  # Input: $0.30 / 1M tokens (text/image)
+  # Output images priced at $30 / 1M tokens (equivalent to ~$0.039 per 1024px image at 1290 image tokens)
+  models/gemini-2.5-flash-image:
+    input_text: 0.30
+    input_image: 0.30
+    output_text: 0.0
+    output_image: 30.00
+
+  # Imagen pricing is per-image (not token-based). Not used by this app (Imagen models use `predict`, not `generateContent`).
+  imagen-4.0-fast-generate-001:
+    per_image: 0.02
+  imagen-4.0-generate-001:
+    per_image: 0.04
+  imagen-4.0-ultra-generate-001:
+    per_image: 0.06
+
+# Generation settings
+max_attempts_per_sku: 25
+max_total_generations: 0   # 0 = unlimited for this run
+min_seconds_between_requests: 1.0
+#
+# If you hit 429 RESOURCE_EXHAUSTED (common on new projects), increase this to 5–10+
+# and generate for fewer references at a time.
+
+# Parallel sessions (multiple browser windows)
+# The app leases SKUs so multiple windows can work without duplicating work.
+max_parallel_sessions: 40
+lease_ttl_seconds: 600
+max_inflight_generations: 4
+
+# Temp retention
+# Keep temp outputs only for the most recently generated N SKUs. Older SKU temp dirs are deleted.
+temp_keep_last_skus: 40
+
+# Image output format
+output_format: "jpg"       # png|jpg
+
+# Quality guard (cheap heuristic auto-reject)
+quality_guard_enabled: true
+quality_edge_corr_threshold: 0.22
+quality_luma_corr_threshold: 0.30
+
+# Streamlit
+page_title: "Jewellery Generator Review"

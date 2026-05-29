@@ -1,0 +1,7 @@
+.env
+outputs/
+pics_raw/
+__pycache__/
+.streamlit/
+venv/
+dslr_shots/
