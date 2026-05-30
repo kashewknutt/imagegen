@@ -109,9 +109,15 @@ def iter_rows(
                 non_empty = [v for v in cells.values() if str(v).strip() != ""]
                 if len(non_empty) >= 3:
                     max_col = max(cells.keys()) if cells else 0
-                    headers = [cells.get(i, "").strip() for i in range(1, max_col + 1)]
-                    # Normalize header names; fallback to colN for blanks
-                    headers = [h if h else f"col{i}" for i, h in enumerate(headers, start=1)]
+                    raw_headers = [cells.get(i, "").strip() for i in range(1, max_col + 1)]
+                    # Normalize header names; fallback to colN for blanks; de-dupe by suffixing _2, _3, ...
+                    counts: dict[str, int] = {}
+                    headers = []
+                    for i, h in enumerate(raw_headers, start=1):
+                        base = h if h else f"col{i}"
+                        n = counts.get(base, 0) + 1
+                        counts[base] = n
+                        headers.append(base if n == 1 else f"{base}_{n}")
                     header_row_idx = int(r.attrib.get("r", "0") or 0)
                     break
 
@@ -152,4 +158,3 @@ def index_by_sku(rows: list[XlsxRow], sku_column: str = "SKU") -> dict[str, Xlsx
         if sku not in out:
             out[sku] = r
     return out
-

@@ -55,6 +55,16 @@ pricing_usd_per_million_tokens:
     output_text: 0.0
     output_image: 30.00
 
+  # Gemini 2.5 Flash (text/multimodal)
+  # Pricing from Gemini API pricing page (paid tier, per 1M tokens):
+  # Input: $0.30 (text / image / video)
+  # Output (including thinking tokens): $2.50
+  models/gemini-2.5-flash:
+    input_text: 0.30
+    input_image: 0.30
+    output_text: 2.50
+    output_image: 0.0
+
   # Imagen pricing is per-image (not token-based). Not used by this app (Imagen models use `predict`, not `generateContent`).
   imagen-4.0-fast-generate-001:
     per_image: 0.02

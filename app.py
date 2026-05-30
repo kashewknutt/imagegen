@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,8 +29,79 @@ from src.xlsx_ingest import iter_rows as xlsx_iter_rows, index_by_sku as xlsx_in
 
 from src.image_resolve import SUPPORTED_EXTS
 from src.lease import try_acquire_lease, list_active_leases
+from src.upload_store import UploadStore
+from src.shopify_client import ShopifyClient, ShopifyConfig
+from src.shopify_token_cache import load_cached_token, save_cached_token, CachedToken
+from src.shopify_settings import load_shopify_settings, save_shopify_settings, ShopifySettings
+from src.drive_client import ensure_client_secret_saved, get_drive_service, list_videos_for_sku, download_file_to_cache
 
 log = logging.getLogger(__name__)
+
+
+def _usage_to_dict(usage) -> dict | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage
+    # google-genai types are often pydantic models
+    if hasattr(usage, "model_dump"):
+        try:
+            return usage.model_dump()
+        except Exception:
+            return None
+    if hasattr(usage, "to_dict"):
+        try:
+            return usage.to_dict()
+        except Exception:
+            return None
+    return None
+
+
+def _log_ai_cost(
+    *,
+    cfg,
+    sku: str,
+    prompt_id: str,
+    model: str,
+    resp,
+    status: str = "success",
+    error: str = "",
+) -> None:
+    try:
+        usage = _usage_to_dict(getattr(resp, "usage_metadata", None))
+        response_id = str(getattr(resp, "response_id", "") or "")
+        model_version = str(getattr(resp, "model_version", "") or "")
+        prompt_tokens = int((usage or {}).get("prompt_token_count") or 0) if isinstance(usage, dict) else 0
+        cand_tokens = int((usage or {}).get("candidates_token_count") or 0) if isinstance(usage, dict) else 0
+        img_prompt, img_cand = extract_image_modality_tokens(usage if isinstance(usage, dict) else None)
+        est = estimate_cost_usd(
+            getattr(cfg, "pricing_usd_per_million_tokens", {}) or {},
+            model,
+            prompt_tokens,
+            cand_tokens,
+            image_prompt_tokens=img_prompt,
+            image_candidates_tokens=img_cand,
+        )
+        append_cost_row(
+            cfg.cost_log_csv,
+            make_generate_row(
+                key=sku,
+                ref_tag="",
+                prompt_id=prompt_id,
+                attempt=0,
+                model=model,
+                mode="devapi",
+                status=status,
+                action="ai_meta",
+                usage_metadata=usage if isinstance(usage, dict) else None,
+                response_id=response_id,
+                model_version=model_version,
+                estimated_cost_usd=est,
+                error=error,
+            ),
+        )
+    except Exception:
+        pass
 
 
 def _load_image(path: Path) -> Image.Image:
@@ -72,6 +146,387 @@ def _list_candidates_for_key(images_dir: Path, key: str) -> list[Path]:
         if base_key_from_path(p) == key:
             out.append(p)
     return out
+
+
+def _load_json_file(path: Path) -> dict:
+    try:
+        import json
+
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_json_file(path: Path, data: dict) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+_PROMPT_RE = re.compile(r"^prompt(?P<prompt>[12])_v(?P<ver>\d+)\.(?P<ext>png|jpe?g)$", re.IGNORECASE)
+
+
+def _list_output_versions(outputs_dir: Path, sku: str) -> dict[int, dict[str, Path]]:
+    """
+    Returns: {version: {"p1": Path?, "p2": Path?}}
+    """
+    out: dict[int, dict[str, Path]] = {}
+    candidates = [
+        outputs_dir / sku,
+        outputs_dir / sku / sku,  # legacy nested layout
+        outputs_dir / f"{sku}_2",  # legacy suffixed layout
+    ]
+    d = next((p for p in candidates if p.exists() and p.is_dir()), None)
+    if d is None:
+        return out
+    for p in d.iterdir():
+        if not p.is_file():
+            continue
+        m = _PROMPT_RE.match(p.name)
+        if not m:
+            continue
+        ver = int(m.group("ver"))
+        slot = "p1" if m.group("prompt") == "1" else "p2"
+        out.setdefault(ver, {})[slot] = p
+    return out
+
+
+def _normalize_category(value: str) -> str:
+    v = (value or "").strip()
+    if v.lower() == "pandent":
+        return "pendant"
+    return v
+
+
+def _parse_float(value: object) -> float | None:
+    try:
+        s = str(value).strip().replace(",", "")
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def _gid_to_int(gid: str) -> int | None:
+    # gid://shopify/Variant/1234567890 -> 1234567890
+    try:
+        s = str(gid or "").strip()
+        if not s:
+            return None
+        return int(s.rsplit("/", 1)[-1])
+    except Exception:
+        return None
+
+
+_SHOPIFY_PRODUCT_TYPES = [
+    "Anklets",
+    "Watch Accessories",
+    "Watches",
+    "Smart Watches",
+    "Body Jewelry",
+    "Bracelets",
+    "Brooches & Lapel Pins",
+    "Charms & Pendants",
+    "Earrings",
+    "Jewelry Sets",
+    "Necklaces",
+    "Rings",
+]
+
+
+def _map_to_shopify_product_type(category: str) -> str:
+    c = (category or "").strip().lower()
+    mapping = {
+        "anklets": "Anklets",
+        "watch accessories": "Watch Accessories",
+        "watches": "Watches",
+        "smart watches": "Smart Watches",
+        "body jewelry": "Body Jewelry",
+        "bracelets": "Bracelets",
+        "bracelet": "Bracelets",
+        "brooches": "Brooches & Lapel Pins",
+        "brooches & lapel pins": "Brooches & Lapel Pins",
+        "charms": "Charms & Pendants",
+        "pendant": "Charms & Pendants",
+        "pendants": "Charms & Pendants",
+        "charms & pendants": "Charms & Pendants",
+        "earring": "Earrings",
+        "earrings": "Earrings",
+        "jewelry sets": "Jewelry Sets",
+        "necklace": "Necklaces",
+        "necklaces": "Necklaces",
+        "ring": "Rings",
+        "rings": "Rings",
+        "legwear": "Anklets",
+        "chain": "Necklaces",
+    }
+    mapped = mapping.get(c) or category.strip().title()
+    return mapped if mapped in _SHOPIFY_PRODUCT_TYPES else ""
+
+
+def _collection_title(value: str) -> str:
+    v = _normalize_category(value)
+    return v.strip().title()
+
+
+def _ai_suggest_tags(*, category: str, subcategory: str, metal_type: str, metal_color: str, made_for: str) -> list[str]:
+    """
+    Optional helper to propose human-friendly merchandising tags like:
+      wedding, everyday, party, office, gifting, festive, etc.
+    Uses Gemini Developer API key if present; otherwise returns [].
+    """
+    api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return []
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
+        prompt = (
+            "You are helping tag an Indian jewellery product for Shopify.\n"
+            "Return ONLY a comma-separated list of 5 to 10 short, human-friendly tags.\n"
+            "No hashtags, no SKU, no metal names unless important.\n"
+            "Prefer intents/occasions/styles like: wedding, everyday, office, party, festive, gifting, minimal, statement, traditional, modern.\n\n"
+            f"Category: {category}\n"
+            f"SubCategory: {subcategory}\n"
+            f"Metal Type: {metal_type}\n"
+            f"Metal Color: {metal_color}\n"
+            f"Made For: {made_for}\n"
+        )
+        resp = client.models.generate_content(model="models/gemini-2.5-flash", contents=prompt)
+        text = (getattr(resp, "text", None) or "").strip()
+        if not text:
+            # Try canonical candidate parts
+            try:
+                cand = (resp.candidates or [])[0]
+                parts = (cand.content.parts or [])
+                text = " ".join([p.text for p in parts if getattr(p, "text", None)]).strip()
+            except Exception:
+                text = ""
+        tags = [t.strip() for t in text.split(",") if t.strip()]
+        # De-dupe while preserving order
+        out: list[str] = []
+        seen = set()
+        for t in tags:
+            key = t.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(t)
+        return out[:10]
+    except Exception:
+        return []
+
+
+def _ai_generate_title_description(
+    cfg,
+    *,
+    category: str,
+    subcategory: str,
+    metal_type: str,
+    metal_color: str,
+    made_for: str,
+    price: str,
+    sku: str,
+) -> tuple[str, str]:
+    api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return "", ""
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
+        model = "models/gemini-2.5-flash"
+        prompt = (
+            "Generate a Shopify product Title and Description for an Indian jewellery product.\n"
+            "Rules:\n"
+            "- Title must start with 'ZOCI'.\n"
+            "- Do NOT include SKU in the title.\n"
+            "- Use an Amazon-like concise title including jewellery type and key attributes.\n"
+            "- Description: exactly ONE plain paragraph (3–4 lines). No bullet points. No headings. No markdown.\n"
+            "- Do not invent gemstones or materials beyond what is provided.\n"
+            "- Output format EXACTLY:\n"
+            "TITLE: ...\n"
+            "DESCRIPTION: ...\n"
+            f"SKU: {sku}\n"
+            f"Category: {category}\n"
+            f"SubCategory: {subcategory}\n"
+            f"Metal Type: {metal_type}\n"
+            f"Metal Color: {metal_color}\n"
+            f"Made For: {made_for}\n"
+            f"Price: {price}\n"
+        )
+        resp = client.models.generate_content(model=model, contents=prompt)
+        _log_ai_cost(cfg=cfg, sku=sku, prompt_id="title_desc", model=model, resp=resp)
+        text = (getattr(resp, "text", None) or "").strip()
+        if not text:
+            try:
+                cand = (resp.candidates or [])[0]
+                parts = (cand.content.parts or [])
+                text = "\n".join([p.text for p in parts if getattr(p, "text", None)]).strip()
+            except Exception:
+                text = ""
+        if not text:
+            return "", ""
+        title = ""
+        desc = ""
+        if "TITLE:" in text:
+            lines = [l.rstrip() for l in text.splitlines()]
+            for i, l in enumerate(lines):
+                if l.startswith("TITLE:"):
+                    title = l.split("TITLE:", 1)[1].strip()
+                if l.startswith("DESCRIPTION:"):
+                    desc = l.split("DESCRIPTION:", 1)[1].strip()
+                    # If model wrapped onto next lines, join remaining lines as continuation.
+                    tail = "\n".join(lines[i + 1 :]).strip()
+                    if tail:
+                        desc = (desc + " " + tail).strip()
+                    break
+        return title, desc
+    except Exception:
+        try:
+            _log_ai_cost(cfg=cfg, sku=sku, prompt_id="title_desc", model="models/gemini-2.5-flash", resp=type("R", (), {"usage_metadata": None})(), status="error", error="ai_generate_failed")
+        except Exception:
+            pass
+        return "", ""
+
+
+def _ai_classify_shopify_type(
+    cfg,
+    *,
+    sku: str,
+    category: str,
+    subcategory: str,
+    metal_type: str,
+    metal_color: str,
+    made_for: str,
+) -> str:
+    api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return ""
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
+        model = "models/gemini-2.5-flash"
+        labels = ", ".join(_SHOPIFY_PRODUCT_TYPES)
+        prompt = (
+            "Classify this jewellery product into EXACTLY ONE of the following Shopify product type labels:\n"
+            f"{labels}\n\n"
+            "Rules:\n"
+            "- Output ONLY the label text, nothing else.\n"
+            "- Choose the closest match.\n\n"
+            f"Category: {category}\n"
+            f"SubCategory: {subcategory}\n"
+            f"Metal Type: {metal_type}\n"
+            f"Metal Color: {metal_color}\n"
+            f"Made For: {made_for}\n"
+        )
+        resp = client.models.generate_content(model=model, contents=prompt)
+        _log_ai_cost(cfg=cfg, sku=sku, prompt_id="classify_type", model=model, resp=resp)
+        label = (getattr(resp, "text", None) or "").strip()
+        if label not in _SHOPIFY_PRODUCT_TYPES:
+            # Try to salvage by exact match ignoring case.
+            for x in _SHOPIFY_PRODUCT_TYPES:
+                if x.lower() == label.lower():
+                    return x
+            return ""
+        return label
+    except Exception:
+        return ""
+
+
+def _ai_choose_taxonomy_category_gid(
+    cfg,
+    *,
+    sku: str,
+    candidates: list[dict[str, str]],
+    category: str,
+    subcategory: str,
+    metal_type: str,
+    metal_color: str,
+    made_for: str,
+) -> str:
+    """
+    Given Shopify taxonomy candidates (from Admin GraphQL), ask AI to pick the best category GID.
+    Returns "" if not confident / no API key.
+    """
+    if not candidates:
+        return ""
+    api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return ""
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))
+        lines = []
+        for i, c in enumerate(candidates[:20], start=1):
+            cid = str(c.get("id") or "")
+            name = str(c.get("fullName") or c.get("name") or "")
+            lines.append(f"{i}. {cid} | {name}")
+        prompt = (
+            "Pick the best matching Shopify taxonomy category for this jewellery product.\n"
+            "Rules:\n"
+            "- Output ONLY the selected category id (the gid://... value) from the list.\n"
+            "- Prefer Jewelry-related categories.\n\n"
+            f"Product context:\n"
+            f"- Category: {category}\n"
+            f"- SubCategory: {subcategory}\n"
+            f"- Metal Type: {metal_type}\n"
+            f"- Metal Color: {metal_color}\n"
+            f"- Made For: {made_for}\n\n"
+            "Candidates:\n"
+            + "\n".join(lines)
+        )
+        model = "models/gemini-2.5-flash"
+        resp = client.models.generate_content(model=model, contents=prompt)
+        _log_ai_cost(cfg=cfg, sku=sku, prompt_id="choose_taxonomy", model=model, resp=resp)
+        text = (getattr(resp, "text", None) or "").strip()
+        ids = {str(c.get("id") or "") for c in candidates}
+        return text if text in ids else ""
+    except Exception:
+        return ""
+
+
+def _shopify_metafield_value_for(def_name: str, *, product_type: str, subcategory: str, metal_type: str, metal_color: str, made_for: str) -> str | None:
+    """
+    Maps Shopify standard category metafield display names to values from our XLSX context.
+    Only returns values for fields we can populate with reasonable confidence.
+    """
+    n = (def_name or "").strip().lower()
+    if n == "color":
+        return metal_color or None
+    if n == "jewelry material":
+        return metal_type or None
+    if n == "target gender":
+        mf = (made_for or "").strip().lower()
+        if mf in {"women", "woman", "female", "f"}:
+            return "female"
+        if mf in {"men", "man", "male", "m"}:
+            return "male"
+        if mf:
+            return mf
+        return None
+    if n == "age group":
+        return "adult"
+    if n == "jewelry type":
+        return product_type or None
+    if n in {"bracelet design", "necklace design"}:
+        return subcategory or None
+    # Not confidently mappable without more data
+    # - Jewelry type (handled above)
+    return None
 
 
 def _render_gallery(cfg) -> None:
@@ -218,6 +673,917 @@ def _render_costs(cfg) -> None:
 
     st.subheader("Raw log")
     st.dataframe(df.tail(200), width="stretch")
+
+
+def _render_upload(cfg) -> None:
+    st.subheader("Upload to Shopify (Queue)")
+
+    with st.sidebar:
+        st.subheader("Shopify")
+        settings_path = cfg.outputs_dir / ".shopify_settings.json"
+        saved = load_shopify_settings(settings_path)
+        if saved:
+            st.session_state.setdefault("shopify_domain", saved.shop_domain)
+            st.session_state.setdefault("shopify_client_id", saved.client_id)
+            st.session_state.setdefault("shopify_api_version", saved.api_version)
+        sd = st.text_input("Shop domain", value=st.session_state.get("shopify_domain", ""), placeholder="yourstore.myshopify.com")
+        client_id = st.text_input("Client ID", value=st.session_state.get("shopify_client_id", ""), type="password")
+        client_secret = st.text_input("Client secret", value=st.session_state.get("shopify_client_secret", ""), type="password")
+        tok = st.text_input(
+            "Access token (optional)",
+            value=st.session_state.get("shopify_token", ""),
+            type="password",
+            help="If empty, click 'Get access token' to request one using Client ID/secret (client credentials grant).",
+        )
+        api_ver = st.text_input("API version", value=st.session_state.get("shopify_api_version", "2024-01"))
+        st.session_state.shopify_domain = sd
+        st.session_state.shopify_client_id = client_id
+        st.session_state.shopify_client_secret = client_secret
+        st.session_state.shopify_token = tok
+        st.session_state.shopify_api_version = api_ver
+
+        cache_path = cfg.outputs_dir / ".shopify_token_cache.json"
+        cache_key = f"{sd}|{client_id}"
+        cached = load_cached_token(cache_path, cache_key) if (sd and client_id) else None
+        if cached and not tok.strip():
+            # Auto-populate if we have a valid cached token (expires ~23h).
+            st.session_state.shopify_token = cached.access_token
+            tok = cached.access_token
+        if cached:
+            st.caption(f"Cached token valid for ~{int((cached.expires_at_epoch - time.time())//60)} min")
+
+        # Persist settings (domain + client id + api version) so reload doesn't require re-entry.
+        if sd.strip():
+            try:
+                save_shopify_settings(
+                    settings_path,
+                    ShopifySettings(shop_domain=sd.strip(), client_id=client_id.strip(), api_version=(api_ver.strip() or "2024-01")),
+                )
+            except Exception:
+                pass
+
+        if st.button("Get access token", width="stretch", disabled=not (sd and client_id and client_secret)):
+            try:
+                data = ShopifyClient.oauth_token_client_credentials(shop_domain=sd, client_id=client_id, client_secret=client_secret)
+                access_token = str(data.get("access_token") or "")
+                expires_in = int(data.get("expires_in") or 0)
+                scope = str(data.get("scope") or "")
+                if not access_token:
+                    raise RuntimeError(f"Token response missing access_token: {data}")
+                st.session_state.shopify_token = access_token
+                save_cached_token(
+                    cache_path,
+                    cache_key,
+                    CachedToken(access_token=access_token, expires_at_epoch=time.time() + float(expires_in or 0), scope=scope),
+                )
+                st.success("Access token acquired and cached locally.")
+            except Exception as e:
+                st.error("Failed to get access token.")
+                st.exception(e)
+
+        if st.button("Test Shopify connection", width="stretch", disabled=not (sd and (tok or cached))):
+            try:
+                token_to_use = tok.strip() if tok.strip() else (cached.access_token if cached else "")
+                name = ShopifyClient(ShopifyConfig(shop_domain=sd, admin_access_token=token_to_use, api_version=api_ver)).ping()
+                st.success(f"Connected: {name}")
+            except Exception as e:
+                st.error("Shopify connection failed.")
+                st.exception(e)
+
+        st.divider()
+        st.subheader("Google Drive (videos)")
+        gdrive_folder_id = st.text_input("Drive folder ID", value=st.session_state.get("gdrive_folder_id", ""))
+        st.session_state.gdrive_folder_id = gdrive_folder_id
+        client_secret_path = cfg.outputs_dir / ".gdrive_client_secret.json"
+        token_path = cfg.outputs_dir / ".gdrive_token.json"
+        uploaded = st.file_uploader("OAuth client JSON", type=["json"], key="gdrive_client_json")
+        if uploaded is not None:
+            try:
+                ensure_client_secret_saved(dest_path=client_secret_path, uploaded_bytes=uploaded.getvalue())
+                st.success("Saved OAuth client JSON.")
+            except Exception as e:
+                st.error("Failed to save client JSON.")
+                st.exception(e)
+        gdrive_ready = client_secret_path.exists()
+        if st.button("Connect Google Drive", width="stretch", disabled=not gdrive_ready):
+            try:
+                _ = get_drive_service(client_secret_path=client_secret_path, token_path=token_path)
+                st.success("Google Drive connected (token saved).")
+            except Exception as e:
+                st.error("Google Drive connection failed.")
+                st.exception(e)
+
+    # Upload uses ONLY the Total sheet as source-of-truth.
+    all_sheets = ["Total"]
+    rows = xlsx_iter_rows(cfg.xlsx_path, all_sheets)
+    sku_map = xlsx_index_by_sku(rows, sku_column="SKU")
+
+    # Eligible SKUs are those with prompt2_vN present in outputs.
+    eligible: list[str] = []
+    sku_versions: dict[str, dict[int, dict[str, Path]]] = {}
+    for sku in sku_map.keys():
+        versions = _list_output_versions(cfg.outputs_dir, sku)
+        if not versions:
+            continue
+        has_p2 = any("p2" in v for v in versions.values())
+        if not has_p2:
+            continue
+        eligible.append(sku)
+        sku_versions[sku] = versions
+
+    eligible.sort()
+    store = UploadStore(cfg.outputs_dir / "upload_state.json")
+    store.ensure_skus(eligible)
+
+    with st.expander("Upload debug", expanded=False):
+        st.write({"xlsx_sheets_found": len(all_sheets), "xlsx_rows": len(rows), "sku_map": len(sku_map), "eligible_with_outputs": len(eligible)})
+        leases_dir = cfg.outputs_dir / "_leases"
+        try:
+            st.write({"leases_dir": str(leases_dir), "leases_files": len(list(leases_dir.glob('*.json')) if leases_dir.exists() else [])})
+        except Exception:
+            pass
+        st.write("Eligible sample:", eligible[:10])
+
+    # Select an actionable SKU (pending preferred), respecting the global lease cap.
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = uuid.uuid4().hex
+    leases_dir = cfg.outputs_dir / "_leases"
+    max_parallel = int(getattr(cfg, "max_parallel_sessions", 4) or 4)
+    lease_ttl = int(getattr(cfg, "lease_ttl_seconds", 3600) or 3600)
+
+    override = st.session_state.get("upload_override_sku")
+    sku_to_open: str | None = None
+    if override and override in eligible:
+        lease = try_acquire_lease(leases_dir, override, str(st.session_state.session_id), ttl_seconds=lease_ttl, max_concurrent=max_parallel)
+        if lease:
+            st.session_state.lease_key = override
+            sku_to_open = override
+    else:
+        for sku in eligible:
+            if store.get(sku).status != "pending":
+                continue
+            lease = try_acquire_lease(leases_dir, sku, str(st.session_state.session_id), ttl_seconds=lease_ttl, max_concurrent=max_parallel)
+            if lease:
+                st.session_state.lease_key = sku
+                sku_to_open = sku
+                break
+
+    if not sku_to_open:
+        st.info("No upload-eligible SKUs available (either none exist or all are leased/uploaded).")
+        return
+
+    xr = sku_map.get(sku_to_open)
+    row_vals = getattr(xr, "values", {}) if xr else {}
+    category = _normalize_category(str(row_vals.get("category") or ""))
+    subcategory = str(row_vals.get("subCategory") or "").strip()
+    metal_type = str(row_vals.get("metalType") or "").strip()
+    metal_color = str(row_vals.get("metalColor") or "").strip()
+    made_for = str(row_vals.get("madeFor") or "").strip()
+    # NOTE (Stock.xlsx / Total):
+    # - `price_2` is the selling price column.
+    # - cost per item is derived from Labour + (rate * weight) (weight in grams).
+    price_sell = str(row_vals.get("price_2") or "").strip()
+    labour = _parse_float(row_vals.get("Labour"))
+    rate = _parse_float(row_vals.get("rate"))
+    weight_g = _parse_float(row_vals.get("weight"))
+    qty = int(_parse_float(row_vals.get("quantity")) or 0)
+    computed_cost = None
+    if labour is not None and rate is not None:
+        if weight_g is not None:
+            computed_cost = labour + (rate * weight_g)
+        else:
+            computed_cost = labour + rate
+    price_cost = f"{computed_cost:.2f}" if computed_cost is not None else ""
+    # Fallback if price_2 missing.
+    if not price_sell:
+        price_sell = str(row_vals.get("price") or "").strip()
+
+    st.markdown(f"### SKU: `{sku_to_open}`")
+    st.caption(
+        f"Category: `{category}` | Sub: `{subcategory}` | Metal: `{metal_type}` / `{metal_color}` | Made for: `{made_for}` | Sell: `{price_sell}` | Cost: `{price_cost}`"
+    )
+
+    with st.expander("Reference images (pics_raw)", expanded=False):
+        refs = _list_candidates_for_key(cfg.images_dir, sku_to_open)
+        if not refs:
+            st.info("No reference images found in pics_raw for this SKU.")
+        else:
+            cols = st.columns(min(4, len(refs)))
+            for i, p in enumerate(refs):
+                with cols[i % len(cols)]:
+                    img = _safe_open_image(p)
+                    if img is None:
+                        st.warning(p.name)
+                    else:
+                        st.image(img, caption=p.name, width="stretch")
+
+    # Select additional pics_raw images to upload to Shopify.
+    st.subheader("Select pics_raw to upload (optional)")
+    pics = _list_candidates_for_key(cfg.images_dir, sku_to_open)
+    rec = store.get_record(sku_to_open)
+    pics_sel_key = f"upload_pics_raw_sel::{sku_to_open}"
+    persisted_pics = rec.get("pics_raw_selected") or []
+    if pics_sel_key not in st.session_state:
+        if isinstance(persisted_pics, list) and persisted_pics:
+            st.session_state[pics_sel_key] = [str(x) for x in persisted_pics]
+        elif len(pics) == 1:
+            st.session_state[pics_sel_key] = [pics[0].name]
+        else:
+            st.session_state[pics_sel_key] = []
+
+    if not pics:
+        st.caption("No pics_raw matches for this SKU.")
+    else:
+        cols = st.columns(min(4, len(pics)))
+        current = set(st.session_state.get(pics_sel_key) or [])
+        for i, p in enumerate(pics):
+            with cols[i % len(cols)]:
+                img = _safe_open_image(p)
+                if img is None:
+                    st.warning(p.name)
+                else:
+                    st.image(img, caption=p.name, width="stretch")
+                checked = p.name in current
+                if st.checkbox("Upload", value=checked, key=f"pick_pic::{sku_to_open}::{p.name}"):
+                    current.add(p.name)
+                else:
+                    current.discard(p.name)
+        st.session_state[pics_sel_key] = sorted(current)
+        store.update(sku_to_open, pics_raw_selected=list(st.session_state[pics_sel_key]))
+
+    # Drive videos (match by filename contains SKU)
+    st.subheader("Select videos to upload (Google Drive)")
+    drive_folder_id = str(st.session_state.get("gdrive_folder_id") or "").strip()
+    drive_client_secret = cfg.outputs_dir / ".gdrive_client_secret.json"
+    drive_token = cfg.outputs_dir / ".gdrive_token.json"
+    drive_files: list = []
+    drive_sel_key = f"upload_drive_videos_sel::{sku_to_open}"
+    persisted_vids = rec.get("drive_video_selected") or []
+    if drive_sel_key not in st.session_state:
+        st.session_state[drive_sel_key] = list(persisted_vids) if isinstance(persisted_vids, list) else []
+    if not (drive_folder_id and drive_client_secret.exists()):
+        st.caption("Drive not configured (set Folder ID and connect in sidebar).")
+    else:
+        try:
+            svc = get_drive_service(client_secret_path=drive_client_secret, token_path=drive_token)
+            drive_files = list_videos_for_sku(service=svc, folder_id=drive_folder_id, sku=sku_to_open)
+        except Exception as e:
+            st.warning("Drive lookup failed.")
+            st.exception(e)
+            drive_files = []
+        if not drive_files:
+            st.caption("No matching Drive videos found for this SKU.")
+        elif len(drive_files) == 1 and not st.session_state[drive_sel_key]:
+            st.session_state[drive_sel_key] = [drive_files[0].id]
+        else:
+            for f in drive_files:
+                col1, col2, col3 = st.columns([1, 3, 1])
+                with col1:
+                    st.checkbox("Upload video", value=(f.id in set(st.session_state[drive_sel_key] or [])), key=f"pick_vid::{sku_to_open}::{f.id}")
+                with col2:
+                    st.write(f"{f.name} ({f.size/1_000_000:.1f} MB)")
+                with col3:
+                    if st.button("Preview", key=f"preview_vid::{sku_to_open}::{f.id}", width="stretch"):
+                        try:
+                            cache = cfg.outputs_dir / "_gdrive_cache" / f"{f.id}.bin"
+                            local_path = download_file_to_cache(service=svc, file_id=f.id, cache_path=cache)
+                            st.video(local_path.read_bytes())
+                        except Exception as e:
+                            st.error("Preview failed.")
+                            st.exception(e)
+            selected = []
+            for f in drive_files:
+                if st.session_state.get(f"pick_vid::{sku_to_open}::{f.id}"):
+                    selected.append(f.id)
+            st.session_state[drive_sel_key] = selected
+        store.update(sku_to_open, drive_video_selected=list(st.session_state[drive_sel_key]))
+
+    versions = sku_versions.get(sku_to_open) or {}
+    available_vers = sorted(versions.keys(), reverse=True)
+    default_ver = available_vers[0] if available_vers else 1
+    chosen_ver = st.selectbox("Select image version to upload", options=available_vers, index=0)
+
+    p1 = versions.get(int(chosen_ver), {}).get("p1")
+    p2 = versions.get(int(chosen_ver), {}).get("p2")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("Prompt 2 (product photo)")
+        if p2 and p2.exists():
+            st.image(_load_image(p2), width="stretch")
+        else:
+            st.warning("No prompt2 image for this version.")
+    with c2:
+        st.caption("Prompt 1 (lifestyle try-on)")
+        if p1 and p1.exists():
+            st.image(_load_image(p1), width="stretch")
+        else:
+            st.warning("No prompt1 image for this version.")
+
+    with st.expander("All generated outputs (outputs/{SKU})", expanded=False):
+        out_dir = cfg.outputs_dir / sku_to_open
+        if not out_dir.exists():
+            st.info("No outputs directory for this SKU.")
+        else:
+            files = [p for p in sorted(out_dir.iterdir()) if p.is_file()]
+            if not files:
+                st.info("No files in outputs directory for this SKU.")
+            else:
+                cols = st.columns(min(4, len(files)))
+                for i, fp in enumerate(files):
+                    with cols[i % len(cols)]:
+                        if fp.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                            img = _safe_open_image(fp)
+                            if img is None:
+                                st.warning(fp.name)
+                            else:
+                                st.image(img, caption=fp.name, width="stretch")
+                        else:
+                            st.write(fp.name)
+
+    st.divider()
+    st.subheader("If images aren’t good enough")
+    if st.button("Regenerate images for this SKU", type="primary", width="stretch"):
+        st.session_state.pending_nav = "Generate"
+        st.session_state.override_key = sku_to_open
+        st.session_state.generated = {}
+        st.session_state.key = ""
+        st.rerun()
+
+    st.divider()
+    st.subheader("Shopify upload (scaffold)")
+    title_key = f"upload_title::{sku_to_open}"
+    desc_key = f"upload_desc::{sku_to_open}"
+    tags_key = f"upload_tags::{sku_to_open}"
+    ai_done_key = f"upload_ai_done::{sku_to_open}"
+    force_ai_key = f"upload_force_ai::{sku_to_open}"
+
+    # Let the user force-refresh AI fields; do it via a rerun so we update Session State
+    # BEFORE widgets are instantiated.
+    if st.button("Regenerate title + description (AI)", width="stretch"):
+        st.session_state[force_ai_key] = True
+        st.rerun()
+
+    # Auto-generate title/description (and default tags) on page load once per SKU.
+    # This must run before creating widgets with these keys.
+    need_ai = bool(st.session_state.get(force_ai_key)) or (not bool(st.session_state.get(ai_done_key)))
+    if need_ai and (not str(st.session_state.get(title_key) or "").strip() or not str(st.session_state.get(desc_key) or "").strip()):
+        t, d = _ai_generate_title_description(
+            cfg,
+            category=_collection_title(category),
+            subcategory=subcategory,
+            metal_type=metal_type,
+            metal_color=metal_color,
+            made_for=made_for,
+            price=price_sell,
+            sku=sku_to_open,
+        )
+        if t:
+            st.session_state[title_key] = t
+        if d:
+            st.session_state[desc_key] = d
+        # Default tags: include subCategory if present.
+        if tags_key not in st.session_state:
+            st.session_state[tags_key] = (subcategory.title() if subcategory else "")
+        st.session_state[ai_done_key] = True
+        st.session_state[force_ai_key] = False
+    else:
+        st.session_state.setdefault(title_key, "")
+        st.session_state.setdefault(desc_key, "")
+        if tags_key not in st.session_state:
+            st.session_state[tags_key] = (subcategory.title() if subcategory else "")
+        st.session_state.setdefault(ai_done_key, False)
+        st.session_state.setdefault(force_ai_key, False)
+
+    title = st.text_input("Title", key=title_key, placeholder="e.g. ZOCI Sterling Silver Bolo Bracelet for Women")
+    desc = st.text_area("Description (HTML allowed)", key=desc_key, height=120)
+    tags = st.text_input("Tags (comma-separated)", key=tags_key, placeholder="e.g. wedding, everyday, gifting")
+    ccol1, ccol2, ccol3 = st.columns(3)
+    with ccol1:
+        add_to_category_collection = st.checkbox("Add to category collection", value=True)
+    with ccol2:
+        add_to_landing = st.checkbox("Add to landing_page", value=False)
+    with ccol3:
+        add_to_bestseller = st.checkbox("Add to bestseller", value=False)
+    with st.container():
+        if st.button("Suggest tags (AI)", width="stretch"):
+            suggested = _ai_suggest_tags(
+                category=_collection_title(category),
+                subcategory=subcategory,
+                metal_type=metal_type,
+                metal_color=metal_color,
+                made_for=made_for,
+            )
+            if suggested:
+                st.session_state[tags_key] = ", ".join(suggested)
+                st.rerun()
+            else:
+                st.warning("No API key set or tag suggestion failed.")
+
+    # Ensure tags reflect collection choices for landing_page/bestseller smart collections.
+    collection_tags: list[str] = []
+    if add_to_landing:
+        collection_tags.append("landing_page")
+    if add_to_bestseller:
+        collection_tags.append("bestseller")
+    st.caption("Note: publishing to sales channels is not wired yet; products will be created as unpublished by default.")
+
+    cache_path = cfg.outputs_dir / ".shopify_token_cache.json"
+    cache_key = f"{sd}|{st.session_state.get('shopify_client_id','')}"
+    cached = load_cached_token(cache_path, cache_key) if (sd and st.session_state.get("shopify_client_id")) else None
+    token_to_use = tok.strip() if tok.strip() else (cached.access_token if cached else "")
+
+    # --- Shopify taxonomy Category (UI + persisted choice) ---
+    classify_key = f"shopify_type_classified::{sku_to_open}"
+    if classify_key not in st.session_state:
+        st.session_state[classify_key] = _ai_classify_shopify_type(
+            cfg,
+            sku=sku_to_open,
+            category=_collection_title(category),
+            subcategory=subcategory,
+            metal_type=metal_type,
+            metal_color=metal_color,
+            made_for=made_for,
+        )
+    classified_label = str(st.session_state.get(classify_key) or "").strip()
+    product_type = classified_label or _map_to_shopify_product_type(_collection_title(category))
+
+    taxonomy_gid = str(store.get_record(sku_to_open).get("taxonomy_category_gid") or "").strip()
+    taxonomy_candidates_key = f"taxonomy_candidates::{sku_to_open}"
+    taxonomy_candidates: list[dict[str, str]] = list(st.session_state.get(taxonomy_candidates_key) or [])
+    if sd and token_to_use and not taxonomy_candidates:
+        try:
+            tmp_client = ShopifyClient(ShopifyConfig(shop_domain=sd, admin_access_token=token_to_use, api_version=api_ver))
+            taxonomy_candidates = tmp_client.taxonomy_search_categories(search=product_type or category, first=25)
+            # Ask AI to choose the best candidate id from the returned list.
+            chosen = _ai_choose_taxonomy_category_gid(
+                cfg,
+                sku=sku_to_open,
+                candidates=taxonomy_candidates,
+                category=_collection_title(category),
+                subcategory=subcategory,
+                metal_type=metal_type,
+                metal_color=metal_color,
+                made_for=made_for,
+            )
+            if chosen:
+                taxonomy_gid = chosen
+                store.update(sku_to_open, taxonomy_category_gid=taxonomy_gid)
+            st.session_state[taxonomy_candidates_key] = taxonomy_candidates
+        except Exception:
+            taxonomy_candidates = []
+            st.session_state[taxonomy_candidates_key] = []
+    if taxonomy_candidates:
+        opts = [(c.get("fullName") or c.get("name") or c.get("id") or "", c.get("id") or "") for c in taxonomy_candidates]
+        labels = [o[0] for o in opts]
+        ids = [o[1] for o in opts]
+        default_id = taxonomy_gid if taxonomy_gid in ids else ids[0]
+        choice_id = st.selectbox(
+            "Shopify Category (taxonomy)",
+            options=ids,
+            format_func=lambda x: labels[ids.index(x)],
+            index=ids.index(default_id),
+            key=f"taxonomy_choice::{sku_to_open}",
+        )
+        taxonomy_gid = str(choice_id or "").strip()
+        store.update(sku_to_open, taxonomy_category_gid=taxonomy_gid)
+    else:
+        st.caption("No taxonomy categories found (or not connected). Category will remain empty unless your API version supports it and search succeeds.")
+
+    can_upload = bool(sd and token_to_use and title.strip() and p2 and p2.exists())
+    if st.button("Create product + upload images", type="primary", width="stretch", disabled=not can_upload):
+        try:
+            client = ShopifyClient(ShopifyConfig(shop_domain=sd, admin_access_token=token_to_use, api_version=api_ver))
+            with st.spinner("Creating product..."):
+                prod = client.product_create(
+                    title=title.strip(),
+                    description_html=desc or "",
+                    vendor="ZOCI",
+                    product_type=product_type,
+                    category_gid=taxonomy_gid or None,
+                    tags=sorted(set([t.strip() for t in (tags.split(",") if tags else []) if t.strip()] + collection_tags)),
+                )
+            product_id = prod["id"]
+            st.success(f"Created product: {prod.get('handle') or product_id}")
+
+            # Populate inventory/cost/weight from Total (best-effort).
+            variant_id_int = _gid_to_int(prod.get("variant_id") or "")
+            inventory_item_id_int = _gid_to_int(prod.get("inventory_item_id") or "")
+            if variant_id_int:
+                with st.spinner("Setting SKU + price..."):
+                    client.rest_variant_update(variant_id=variant_id_int, sku=sku_to_open, price=price_sell or None)
+            if inventory_item_id_int:
+                cost_f = _parse_float(price_cost)
+                if cost_f is not None:
+                    with st.spinner("Setting cost per item..."):
+                        client.rest_inventory_item_cost(inventory_item_id=inventory_item_id_int, cost=cost_f)
+            if variant_id_int:
+                if weight_g is not None:
+                    with st.spinner("Setting shipping weight..."):
+                        client.rest_variant_weight(variant_id=variant_id_int, weight_kg=float(weight_g) / 1000.0)
+            if inventory_item_id_int and qty:
+                with st.spinner("Setting inventory quantity..."):
+                    locations = client.rest_locations()
+                    if locations:
+                        location_id = int((locations[0] or {}).get("id") or 0)
+                        if location_id:
+                            client.rest_inventory_set(location_id=location_id, inventory_item_id=inventory_item_id_int, available=int(qty))
+
+            # Set category metafields (standard Shopify definitions) when possible.
+            if taxonomy_gid:
+                try:
+                    defs = client.metafield_definitions_for_category(category_gid=taxonomy_gid, first=50)
+                    metas: list[dict[str, str]] = []
+                    for d in defs:
+                        val = _shopify_metafield_value_for(
+                            d.get("name") or "",
+                            product_type=product_type,
+                            subcategory=subcategory,
+                            metal_type=metal_type,
+                            metal_color=metal_color,
+                            made_for=made_for,
+                        )
+                        if val is None:
+                            continue
+                        metas.append(
+                            {
+                                "namespace": d["namespace"],
+                                "key": d["key"],
+                                "type": d["type"],
+                                "value": str(val),
+                            }
+                        )
+                    if metas:
+                        with st.spinner("Setting category metafields..."):
+                            client.product_update_metafields(product_id=product_id, metafields=metas)
+                except Exception:
+                    # Metafields are best-effort; do not fail upload if store lacks access/scopes.
+                    pass
+
+            media_urls: list[str] = []
+            images_to_upload: list[tuple[Path, str]] = []
+            # Ensure prompt2 first (hero), then prompt1 if present.
+            if p2 and p2.exists():
+                images_to_upload.append((p2, f"{sku_to_open} - Product"))
+            if p1 and p1.exists():
+                images_to_upload.append((p1, f"{sku_to_open} - Lifestyle"))
+            # Add selected pics_raw (if any)
+            selected_pics = [x for x in (st.session_state.get(pics_sel_key) or []) if isinstance(x, str)]
+            for name in selected_pics:
+                pp = cfg.images_dir / name
+                if pp.exists():
+                    images_to_upload.append((pp, f"{sku_to_open} - Reference"))
+
+            for img_path, alt in images_to_upload:
+                with st.spinner(f"Uploading {img_path.name}..."):
+                    mime = "image/jpeg" if img_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+                    target = client.staged_upload_create(filename=img_path.name, mime_type=mime, resource="FILE", http_method="POST")
+                    with st.expander(f"Staged target debug: {img_path.name}", expanded=False):
+                        st.json(target)
+                    client.upload_to_staged_target(target=target, filename=img_path.name, mime_type=mime, file_bytes=img_path.read_bytes())
+                    file_id = client.file_create_from_staged(resource_url=str(target.get("resourceUrl") or target.get("url") or ""), alt=alt, content_type="IMAGE")
+                    ready = client.file_poll_ready(file_id=file_id, max_tries=30, sleep_seconds=2.0)
+                    cdn = str(ready.get("preview_url") or "").strip()
+                    if not cdn:
+                        raise RuntimeError(f"File did not become READY: {ready}")
+                    media_urls.append(cdn)
+
+            if media_urls:
+                with st.spinner("Attaching media to product..."):
+                    client.product_create_media(
+                        product_id=product_id,
+                        media=[{"mediaContentType": "IMAGE", "originalSource": u, "alt": sku_to_open} for u in media_urls],
+                    )
+
+            # Upload Drive videos (if selected)
+            selected_video_ids = [x for x in (st.session_state.get(drive_sel_key) or []) if isinstance(x, str)]
+            if selected_video_ids and drive_folder_id and drive_client_secret.exists():
+                svc = get_drive_service(client_secret_path=drive_client_secret, token_path=drive_token)
+                file_by_id = {f.id: f for f in (drive_files or [])}
+                for vid in selected_video_ids:
+                    f = file_by_id.get(vid)
+                    if not f:
+                        continue
+                    cache = cfg.outputs_dir / "_gdrive_cache" / f"{f.id}.bin"
+                    with st.spinner(f"Downloading video: {f.name}"):
+                        local_path = download_file_to_cache(service=svc, file_id=f.id, cache_path=cache)
+                    with st.spinner(f"Uploading video: {f.name}"):
+                        target = client.staged_upload_create(
+                            filename=f.name,
+                            mime_type=f.mime_type or "video/mp4",
+                            resource="VIDEO",
+                            file_size=int(f.size),
+                            http_method="POST",
+                        )
+                        client.upload_to_staged_target(
+                            target=target,
+                            filename=f.name,
+                            mime_type=f.mime_type or "video/mp4",
+                            file_bytes=local_path.read_bytes(),
+                        )
+                        file_id = client.file_create_from_staged(
+                            resource_url=str(target.get("resourceUrl") or target.get("url") or ""),
+                            alt=f"{sku_to_open} - Video",
+                            content_type="VIDEO",
+                        )
+                        ready = client.file_poll_ready(file_id=file_id, max_tries=90, sleep_seconds=2.0)
+                        # Attach to product using staged resourceUrl (video URL isn't exposed on File in some API versions).
+                        resource_url = str(target.get("resourceUrl") or "").strip()
+                        if not resource_url:
+                            raise RuntimeError(f"Staged target missing resourceUrl for video: {target}")
+                        client.product_create_media(
+                            product_id=product_id,
+                            media=[{"mediaContentType": "VIDEO", "originalSource": resource_url, "alt": sku_to_open}],
+                        )
+
+            # Collections (manual collections + add product).
+            # Smart collections based on tags.
+            # We ensure the collections exist; membership is automatic based on the product tags we set above.
+            with st.spinner("Ensuring smart collections..."):
+                def ensure_smart_collection_by_tag(title: str, tag: str) -> None:
+                    found = client.collection_find_by_title(title=title)
+                    if found and found.get("id"):
+                        return
+                    client.collection_create_smart_by_tag(title=title, tag=tag)
+
+                if add_to_category_collection and category.strip():
+                    # Use product type for category collection (no extra tags needed).
+                    found = client.collection_find_by_title(title=_collection_title(category))
+                    if not found or not found.get("id"):
+                        client.collection_create_smart_by_product_type(title=_collection_title(category), product_type=_collection_title(category))
+                if add_to_landing:
+                    ensure_smart_collection_by_tag("landing_page", "landing_page")
+                if add_to_bestseller:
+                    ensure_smart_collection_by_tag("bestseller", "bestseller")
+
+            store.update(sku_to_open, status="uploaded", product_id=product_id, handle=prod.get("handle") or "", last_error="")
+            st.success("Uploaded successfully.")
+            if st.session_state.get("lease_key") == sku_to_open:
+                try:
+                    (cfg.outputs_dir / "_leases" / f"{sku_to_open}.json").unlink(missing_ok=True)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+                st.session_state.lease_key = ""
+            st.rerun()
+        except Exception as e:
+            store.update(sku_to_open, status="failed", last_error=str(e))
+            st.error("Upload failed.")
+            st.exception(e)
+
+
+def _render_bulk_upload(cfg) -> None:
+    st.subheader("Bulk Upload (Auto)")
+
+    # Shopify creds/live token are stored in session_state by the Upload page sidebar.
+    # Reuse the same state keys here.
+    sd = str(st.session_state.get("shopify_domain") or "").strip()
+    api_ver = str(st.session_state.get("shopify_api_version") or "2024-01").strip() or "2024-01"
+    tok = str(st.session_state.get("shopify_token") or "").strip()
+    client_id = str(st.session_state.get("shopify_client_id") or "").strip()
+    cache_path = cfg.outputs_dir / ".shopify_token_cache.json"
+    cache_key = f"{sd}|{client_id}"
+    cached = load_cached_token(cache_path, cache_key) if (sd and client_id) else None
+    token_to_use = tok if tok else (cached.access_token if cached else "")
+
+    if not (sd and token_to_use):
+        st.warning("Shopify is not configured. Open the Upload tab, connect Shopify, then return here.")
+        return
+
+    # Build eligible SKUs (Total sheet only) where BOTH prompt1+prompt2 exist.
+    rows = xlsx_iter_rows(cfg.xlsx_path, ["Total"])
+    sku_map = xlsx_index_by_sku(rows, sku_column="SKU")
+    sku_versions: dict[str, dict[int, dict[str, Path]]] = {}
+    eligible: list[str] = []
+    for sku in sku_map.keys():
+        versions = _list_output_versions(cfg.outputs_dir, sku)
+        if not versions:
+            continue
+        ok = any(("p1" in v and "p2" in v) for v in versions.values())
+        if not ok:
+            continue
+        eligible.append(sku)
+        sku_versions[sku] = versions
+    eligible.sort()
+
+    store = UploadStore(cfg.outputs_dir / "upload_state.json")
+    store.ensure_skus(eligible)
+
+    uploaded = [s for s in eligible if store.get(s).status == "uploaded"]
+    pending = [s for s in eligible if store.get(s).status == "pending"]
+    failed = [s for s in eligible if store.get(s).status == "failed"]
+
+    st.progress(0.0 if not eligible else (len(uploaded) / max(1, len(eligible))))
+    st.caption(f"Eligible: {len(eligible)} | Uploaded: {len(uploaded)} | Pending: {len(pending)} | Failed: {len(failed)}")
+
+    state_path = cfg.outputs_dir / "bulk_upload_state.json"
+    state = _load_json_file(state_path)
+    running = bool(state.get("running"))
+    last_sku = str(state.get("last_sku") or "")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Start / Resume", type="primary", width="stretch"):
+            state["running"] = True
+            _save_json_file(state_path, state)
+            st.rerun()
+    with c2:
+        if st.button("Pause", width="stretch"):
+            state["running"] = False
+            _save_json_file(state_path, state)
+            st.rerun()
+    with c3:
+        if st.button("Reset cursor (keep uploaded)", width="stretch"):
+            state = {"running": False, "last_sku": ""}
+            _save_json_file(state_path, state)
+            st.rerun()
+
+    if failed:
+        if st.button("Retry failed (set back to pending)", width="stretch"):
+            for s in failed:
+                store.update(s, status="pending", last_error="")
+            state["last_sku"] = ""
+            state["running"] = False
+            _save_json_file(state_path, state)
+            st.success(f"Reset {len(failed)} failed SKUs to pending. Click Start / Resume.")
+            st.stop()
+
+    if not running:
+        st.info("Bulk upload is paused.")
+        return
+
+    # Determine next pending SKU after cursor.
+    queue = pending if not last_sku else [s for s in pending if s > last_sku]
+    if not queue and pending:
+        # Wraparound safety: if cursor is past end, restart from first pending.
+        queue = pending
+    if not queue:
+        st.success("No pending SKUs left to bulk upload.")
+        state["running"] = False
+        _save_json_file(state_path, state)
+        return
+
+    sku = queue[0]
+    xr = sku_map.get(sku)
+    row_vals = getattr(xr, "values", {}) if xr else {}
+    category = _normalize_category(str(row_vals.get("category") or ""))
+    subcategory = str(row_vals.get("subCategory") or "").strip()
+    metal_type = str(row_vals.get("metalType") or "").strip()
+    metal_color = str(row_vals.get("metalColor") or "").strip()
+    made_for = str(row_vals.get("madeFor") or "").strip()
+    price_sell = str(row_vals.get("price_2") or "").strip() or str(row_vals.get("price") or "").strip()
+    labour = _parse_float(row_vals.get("Labour"))
+    rate = _parse_float(row_vals.get("rate"))
+    weight_g = _parse_float(row_vals.get("weight"))
+    qty = int(_parse_float(row_vals.get("quantity")) or 0)
+    computed_cost = None
+    if labour is not None and rate is not None:
+        computed_cost = labour + ((rate * weight_g) if weight_g is not None else rate)
+    price_cost = f"{computed_cost:.2f}" if computed_cost is not None else ""
+
+    versions = sku_versions.get(sku) or {}
+    ver = max(versions.keys()) if versions else 1
+    p1 = versions.get(ver, {}).get("p1")
+    p2 = versions.get(ver, {}).get("p2")
+    if not (p1 and p2 and p1.exists() and p2.exists()):
+        store.update(sku, status="failed", last_error="missing_prompt_images")
+        state["last_sku"] = sku
+        _save_json_file(state_path, state)
+        st.warning(f"Skipping {sku}: missing prompt images for version {ver}.")
+        st.rerun()
+        return
+
+    st.markdown(f"### Now uploading: `{sku}` (v{ver})")
+
+    # Bulk upload rule: upload ALL pics_raw images for this SKU (no approval gating).
+    pics = _list_candidates_for_key(cfg.images_dir, sku)
+    rec = store.get_record(sku)
+    selected_pics = list(pics)
+    # Persist for record-keeping/resume.
+    store.update(sku, pics_raw_selected=[p.name for p in selected_pics])
+
+    # Auto title/desc/type/category (taxonomy best-effort)
+    title, desc = _ai_generate_title_description(
+        cfg,
+        category=_collection_title(category),
+        subcategory=subcategory,
+        metal_type=metal_type,
+        metal_color=metal_color,
+        made_for=made_for,
+        price=price_sell,
+        sku=sku,
+    )
+    if not title:
+        title = f"ZOCI {(_collection_title(category) or 'Jewellery')} {subcategory}".strip()
+    if not desc:
+        desc = f"{title} crafted in {metal_type} with a {metal_color} finish for {made_for}."
+
+    classified_label = _ai_classify_shopify_type(
+        cfg,
+        sku=sku,
+        category=_collection_title(category),
+        subcategory=subcategory,
+        metal_type=metal_type,
+        metal_color=metal_color,
+        made_for=made_for,
+    )
+    product_type = classified_label or _map_to_shopify_product_type(_collection_title(category))
+
+    client = ShopifyClient(ShopifyConfig(shop_domain=sd, admin_access_token=token_to_use, api_version=api_ver))
+    taxonomy_gid = str(rec.get("taxonomy_category_gid") or "").strip()
+    if not taxonomy_gid:
+        try:
+            cands = client.taxonomy_search_categories(search=product_type or category, first=25)
+            taxonomy_gid = _ai_choose_taxonomy_category_gid(
+                cfg,
+                sku=sku,
+                candidates=cands,
+                category=_collection_title(category),
+                subcategory=subcategory,
+                metal_type=metal_type,
+                metal_color=metal_color,
+                made_for=made_for,
+            ) or (cands[0].get("id") if cands else "")
+            if taxonomy_gid:
+                store.update(sku, taxonomy_category_gid=taxonomy_gid)
+        except Exception:
+            taxonomy_gid = ""
+
+    try:
+        prod = client.product_create(
+            title=title.strip(),
+            description_html=desc.strip(),
+            vendor="ZOCI",
+            product_type=product_type,
+            category_gid=taxonomy_gid or None,
+            tags=sorted(set([subcategory.title()] if subcategory else [])),
+        )
+        product_id = prod["id"]
+        variant_id_int = _gid_to_int(prod.get("variant_id") or "")
+        inventory_item_id_int = _gid_to_int(prod.get("inventory_item_id") or "")
+        if variant_id_int:
+            client.rest_variant_update(variant_id=variant_id_int, sku=sku, price=price_sell or None)
+            if weight_g is not None:
+                client.rest_variant_weight(variant_id=variant_id_int, weight_kg=float(weight_g) / 1000.0)
+        if inventory_item_id_int:
+            cost_f = _parse_float(price_cost)
+            if cost_f is not None:
+                client.rest_inventory_item_cost(inventory_item_id=inventory_item_id_int, cost=cost_f)
+            if qty:
+                locs = client.rest_locations()
+                if locs:
+                    location_id = int((locs[0] or {}).get("id") or 0)
+                    if location_id:
+                        client.rest_inventory_set(location_id=location_id, inventory_item_id=inventory_item_id_int, available=int(qty))
+
+        # Category metafields (best-effort)
+        if taxonomy_gid:
+            try:
+                defs = client.metafield_definitions_for_category(category_gid=taxonomy_gid, first=50)
+                metas: list[dict[str, str]] = []
+                for d in defs:
+                    val = _shopify_metafield_value_for(
+                        d.get("name") or "",
+                        product_type=product_type,
+                        subcategory=subcategory,
+                        metal_type=metal_type,
+                        metal_color=metal_color,
+                        made_for=made_for,
+                    )
+                    if val is None:
+                        continue
+                    metas.append({"namespace": d["namespace"], "key": d["key"], "type": d["type"], "value": str(val)})
+                if metas:
+                    client.product_update_metafields(product_id=product_id, metafields=metas)
+            except Exception:
+                pass
+
+        # Upload images: prompt2, prompt1, then selected pics_raw.
+        media_urls: list[str] = []
+        upload_list: list[tuple[Path, str]] = [(p2, f"{sku} - Product"), (p1, f"{sku} - Lifestyle")]
+        upload_list.extend([(pp, f"{sku} - Reference") for pp in selected_pics])
+        for img_path, alt in upload_list:
+            mime = "image/jpeg" if img_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+            target = client.staged_upload_create(filename=img_path.name, mime_type=mime, resource="FILE", http_method="POST")
+            client.upload_to_staged_target(target=target, filename=img_path.name, mime_type=mime, file_bytes=img_path.read_bytes())
+            file_id = client.file_create_from_staged(resource_url=str(target.get("resourceUrl") or target.get("url") or ""), alt=alt, content_type="IMAGE")
+            ready = client.file_poll_ready(file_id=file_id, max_tries=60, sleep_seconds=2.0)
+            cdn = str(ready.get("preview_url") or "").strip()
+            if cdn:
+                media_urls.append(cdn)
+        if media_urls:
+            client.product_create_media(product_id=product_id, media=[{"mediaContentType": "IMAGE", "originalSource": u, "alt": sku} for u in media_urls])
+
+        store.update(sku, status="uploaded", product_id=product_id, handle=prod.get("handle") or "", last_error="")
+        state["last_sku"] = sku
+        _save_json_file(state_path, state)
+        st.success(f"Uploaded: {sku}")
+        st.rerun()
+    except Exception as e:
+        store.update(sku, status="failed", last_error=str(e))
+        state["last_sku"] = sku
+        _save_json_file(state_path, state)
+        st.error(f"Failed: {sku}")
+        st.exception(e)
+        st.rerun()
 
 
 def _render_generate(cfg) -> None:
@@ -792,27 +2158,33 @@ def main() -> None:
     cfg = load_config()
     st.set_page_config(page_title=cfg.page_title, layout="wide")
     st.title(cfg.page_title)
+    try:
+        st.set_option("runner.magicEnabled", False)
+    except Exception:
+        pass
 
-    if "nav" not in st.session_state:
-        st.session_state.nav = "Generate"
-    if "view" not in st.session_state:
-        st.session_state.view = st.session_state.nav
+    nav_options = ["Upload", "Bulk Upload", "Generate", "Gallery", "Costs"]
+    if "nav_widget" not in st.session_state:
+        st.session_state.nav_widget = "Upload"
     if "pending_nav" in st.session_state:
-        st.session_state.nav = st.session_state.pending_nav
-        del st.session_state["pending_nav"]
+        st.session_state.nav_widget = st.session_state.pop("pending_nav")
 
     with st.sidebar:
         st.subheader("View")
         st.radio(
             "Navigation",
-            options=["Generate", "Gallery", "Costs"],
-            index=["Generate", "Gallery", "Costs"].index(st.session_state.nav) if st.session_state.nav in {"Generate", "Gallery", "Costs"} else 0,
+            options=nav_options,
             label_visibility="collapsed",
-            key="nav",
+            key="nav_widget",
+            index=nav_options.index(st.session_state.nav_widget) if st.session_state.nav_widget in nav_options else 0,
         )
-        st.session_state.view = st.session_state.nav
+        st.session_state.view = st.session_state.nav_widget
 
-    if st.session_state.view == "Gallery":
+    if st.session_state.view == "Upload":
+        _render_upload(cfg)
+    elif st.session_state.view == "Bulk Upload":
+        _render_bulk_upload(cfg)
+    elif st.session_state.view == "Gallery":
         _render_gallery(cfg)
     elif st.session_state.view == "Costs":
         _render_costs(cfg)
