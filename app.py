@@ -985,8 +985,13 @@ def _log_title_generation_cost(
     cost: float,
     status: str = "success",
     error: str = "",
+    usage_metadata: dict | None = None,
+    response_id: str = "",
+    model_version: str = "",
+    cost_str: str = "",
 ) -> None:
     try:
+        est = cost_str or (f"{cost:.6f}" if cost else "")
         append_cost_row(
             cfg.cost_log_csv,
             make_generate_row(
@@ -998,15 +1003,51 @@ def _log_title_generation_cost(
                 mode="devapi",
                 status=status,
                 action="ai_meta",
-                usage_metadata=None,
-                response_id="",
-                model_version="",
-                estimated_cost_usd=f"{cost:.6f}" if cost else "",
+                usage_metadata=usage_metadata,
+                response_id=response_id,
+                model_version=model_version,
+                estimated_cost_usd=est,
                 error=error,
             ),
         )
     except Exception:
         pass
+
+
+def _title_gen_cost_summary(cfg, *, catalog: list[dict], store: TitleStore) -> dict[str, float]:
+    """Summarize title-generation costs from local store and cost log."""
+    catalog_total = 0.0
+    for row in catalog:
+        try:
+            catalog_total += float(row.get("total_cost_usd") or row.get("cost_usd") or 0.0)
+        except Exception:
+            pass
+
+    store_total = 0.0
+    for rec in store.all_records().values():
+        try:
+            store_total += float(rec.get("total_cost_usd") or rec.get("cost_usd") or 0.0)
+        except Exception:
+            pass
+
+    log_total = 0.0
+    if cfg.cost_log_csv.exists():
+        try:
+            import pandas as pd
+
+            df = pd.read_csv(cfg.cost_log_csv)
+            if not df.empty and "prompt_id" in df.columns:
+                subset = df[df["prompt_id"] == "vision_title"]
+                if "estimated_cost_usd" in subset.columns:
+                    log_total = float(pd.to_numeric(subset["estimated_cost_usd"], errors="coerce").fillna(0.0).sum())
+        except Exception:
+            pass
+
+    return {
+        "catalog_total": catalog_total,
+        "store_total": store_total,
+        "log_total": log_total,
+    }
 
 
 def _title_product_row(prod: dict, store: TitleStore) -> dict:
@@ -1023,13 +1064,14 @@ def _title_product_row(prod: dict, store: TitleStore) -> dict:
         "generated_title": generated,
         "new_title": new_title,
         "cost_usd": str(saved.get("cost_usd") or ""),
+        "total_cost_usd": str(saved.get("total_cost_usd") or saved.get("cost_usd") or ""),
         "status": str(saved.get("status") or ""),
         "image_url": str(prod.get("primary_image_url") or ""),
         "product_type": str(prod.get("product_type") or ""),
     }
 
 
-def _title_generate_for_row(cfg, *, row: dict, store: TitleStore, model: str) -> dict:
+def _title_generate_for_row(cfg, *, row: dict, store: TitleStore, model: str) -> tuple[dict, float]:
     image_url = str(row.get("image_url") or "")
     key = str(row.get("key") or "")
     if not image_url:
@@ -1041,9 +1083,9 @@ def _title_generate_for_row(cfg, *, row: dict, store: TitleStore, model: str) ->
             model=model,
         )
         row["status"] = "error: missing image"
-        return row
+        return row, 0.0
 
-    title, cost, err = generate_title_from_image(
+    title, cost, err, meta = generate_title_from_image(
         cfg,
         image_url=image_url,
         category_key=str(row.get("category") or "other"),
@@ -1053,8 +1095,19 @@ def _title_generate_for_row(cfg, *, row: dict, store: TitleStore, model: str) ->
         sku=str(row.get("sku") or ""),
         model=model,
     )
+    log_key = key or str(row.get("sku") or "")
     if err:
-        _log_title_generation_cost(cfg, key=key or str(row.get("sku") or ""), model=model, cost=0.0, status="error", error=err)
+        _log_title_generation_cost(
+            cfg,
+            key=log_key,
+            model=str(meta.get("model") or model),
+            cost=0.0,
+            status="error",
+            error=err,
+            usage_metadata=meta.get("usage_metadata"),
+            response_id=str(meta.get("response_id") or ""),
+            model_version=str(meta.get("model_version") or ""),
+        )
         store.update(
             key,
             sku=row.get("sku", ""),
@@ -1063,9 +1116,24 @@ def _title_generate_for_row(cfg, *, row: dict, store: TitleStore, model: str) ->
             model=model,
         )
         row["status"] = f"error: {err}"
-        return row
+        return row, 0.0
 
-    _log_title_generation_cost(cfg, key=key or str(row.get("sku") or ""), model=model, cost=cost)
+    prev_total = 0.0
+    try:
+        prev_total = float(store.get(key).get("total_cost_usd") or store.get(key).get("cost_usd") or 0.0)
+    except Exception:
+        prev_total = 0.0
+    total_cost = prev_total + cost
+    _log_title_generation_cost(
+        cfg,
+        key=log_key,
+        model=str(meta.get("model") or model),
+        cost=cost,
+        usage_metadata=meta.get("usage_metadata") if isinstance(meta.get("usage_metadata"), dict) else None,
+        response_id=str(meta.get("response_id") or ""),
+        model_version=str(meta.get("model_version") or ""),
+        cost_str=str(meta.get("cost_str") or ""),
+    )
     saved = store.update(
         key,
         sku=row.get("sku", ""),
@@ -1073,15 +1141,17 @@ def _title_generate_for_row(cfg, *, row: dict, store: TitleStore, model: str) ->
         generated_title=title,
         new_title=title,
         cost_usd=f"{cost:.6f}",
+        total_cost_usd=f"{total_cost:.6f}",
         status="generated",
         model=model,
     )
     row["generated_title"] = title
     row["new_title"] = title
     row["cost_usd"] = saved.get("cost_usd", "")
+    row["total_cost_usd"] = saved.get("total_cost_usd", "")
     row["status"] = "generated"
     st.session_state[f"title_new::{key}"] = title
-    return row
+    return row, cost
 
 
 def _title_sync_inputs_to_store(store: TitleStore, catalog: list[dict]) -> None:
@@ -1185,11 +1255,16 @@ def _render_title_generator(cfg) -> None:
 
     if generate_all_clicked:
         progress = st.progress(0.0, text="Generating titles for all products...")
+        batch_cost = 0.0
         for i, row in enumerate(catalog):
             progress.progress((i + 1) / max(1, len(catalog)), text=f"Generating {i + 1}/{len(catalog)}...")
-            _title_generate_for_row(cfg, row=row, store=store, model=model)
+            _, run_cost = _title_generate_for_row(cfg, row=row, store=store, model=model)
+            batch_cost += run_cost
         st.session_state.title_gen_catalog = catalog
-        st.success(f"Generated titles for {sum(1 for r in catalog if r.get('status') == 'generated')} product(s).")
+        st.success(
+            f"Generated titles for {sum(1 for r in catalog if r.get('status') == 'generated')} product(s). "
+            f"Batch cost: ${batch_cost:.4f}"
+        )
         st.rerun()
 
     if save_local_clicked:
@@ -1242,13 +1317,13 @@ def _render_title_generator(cfg) -> None:
             st.caption(f"Unfilled quotas from last sample load: {unfilled}")
 
     generated_count = sum(1 for r in catalog if str(r.get("generated_title") or "").strip())
-    total_cost = 0.0
-    for r in catalog:
-        try:
-            total_cost += float(r.get("cost_usd") or 0.0)
-        except Exception:
-            pass
-    st.caption(f"Products: {len(catalog)} | With saved/generated titles: {generated_count} | Total cost: ${total_cost:.4f}")
+    cost_summary = _title_gen_cost_summary(cfg, catalog=catalog, store=store)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Products loaded", len(catalog))
+    m2.metric("With generated titles", generated_count)
+    m3.metric("Catalog gen cost (USD)", f"${cost_summary['catalog_total']:.4f}")
+    m4.metric("All-time vision_title log (USD)", f"${cost_summary['log_total']:.4f}")
+    st.caption("Per-product costs persist locally in outputs/title_gen_state.json and append to outputs/cost_log.csv.")
 
     per_page = st.selectbox("Rows per page", [10, 20, 50], index=1, key="title_gen_per_page")
     max_page = max(1, (len(catalog) + per_page - 1) // per_page)
@@ -1274,15 +1349,22 @@ def _render_title_generator(cfg) -> None:
                 st.markdown(f"**{row.get('sku') or key}** · `{row.get('category') or ''}`")
                 st.caption(f"Current Shopify title: {row.get('current_title') or '—'}")
                 if row.get("generated_title"):
-                    st.caption(f"Last generated: {row.get('generated_title')} · Cost: ${float(row.get('cost_usd') or 0):.4f}")
+                    last_cost = float(row.get("cost_usd") or 0.0)
+                    total_cost = float(row.get("total_cost_usd") or last_cost)
+                    cost_note = f"Last: ${last_cost:.4f}"
+                    if total_cost > last_cost + 1e-9:
+                        cost_note += f" · Total: ${total_cost:.4f}"
+                    st.caption(f"Last generated: {row.get('generated_title')} · {cost_note}")
                 st.text_input(
                     "Title to apply",
                     value=default_new,
                     key=f"title_new::{key}",
                 )
                 if st.button("Generate title", key=f"title_gen_one::{key}", type="primary"):
-                    _title_generate_for_row(cfg, row=row, store=store, model=model)
+                    _, run_cost = _title_generate_for_row(cfg, row=row, store=store, model=model)
                     st.session_state.title_gen_catalog = catalog
+                    if run_cost > 0:
+                        st.toast(f"Generated · cost ${run_cost:.4f}")
                     st.rerun()
                 if row.get("status"):
                     st.caption(f"Status: {row.get('status')}")

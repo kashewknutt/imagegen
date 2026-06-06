@@ -20,6 +20,7 @@ def _default_record(key: str) -> dict[str, Any]:
         "generated_title": "",
         "new_title": "",
         "cost_usd": "",
+        "total_cost_usd": "",
         "status": "",
         "model": "",
         "updated_at_utc": "",

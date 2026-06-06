@@ -117,18 +117,20 @@ def generate_title_from_image(
     product_type: str = "",
     sku: str = "",
     model: str = "models/gemini-2.5-flash",
-) -> tuple[str, float, str]:
+) -> tuple[str, float, str, dict]:
     """
     Vision-based title generation from a product image URL.
-    Returns (title, estimated_cost_usd, error_message).
+    Returns (title, estimated_cost_usd, error_message, meta).
+    meta includes usage_metadata, response_id, model_version, cost_str, model.
     """
     api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    empty_meta: dict = {"usage_metadata": None, "response_id": "", "model_version": "", "cost_str": "", "model": model}
     if not api_key:
-        return "", 0.0, "Missing GOOGLE_API_KEY / GEMINI_API_KEY"
+        return "", 0.0, "Missing GOOGLE_API_KEY / GEMINI_API_KEY", empty_meta
 
     local_path = download_first_image_url([image_url], cache_dir)
     if not local_path:
-        return "", 0.0, f"Could not download image: {image_url}"
+        return "", 0.0, f"Could not download image: {image_url}", empty_meta
 
     try:
         from google import genai
@@ -154,7 +156,7 @@ def generate_title_from_image(
 
         title = parse_generated_title(text)
         if not title:
-            return "", 0.0, "Model returned empty title"
+            return "", 0.0, "Model returned empty title", empty_meta
 
         usage = getattr(resp, "usage_metadata", None)
         usage_dict = usage.model_dump() if hasattr(usage, "model_dump") else (usage if isinstance(usage, dict) else None)
@@ -169,6 +171,14 @@ def generate_title_from_image(
             image_prompt_tokens=img_prompt,
             image_candidates_tokens=img_cand,
         )
-        return title, float(est or 0.0), ""
+        cost_f = float(est) if est else 0.0
+        meta = {
+            "usage_metadata": usage_dict,
+            "response_id": str(getattr(resp, "response_id", "") or ""),
+            "model_version": str(getattr(resp, "model_version", "") or ""),
+            "cost_str": est or f"{cost_f:.6f}",
+            "model": model,
+        }
+        return title, cost_f, "", meta
     except Exception as e:
-        return "", 0.0, str(e)
+        return "", 0.0, str(e), empty_meta
