@@ -220,3 +220,61 @@ def approve_many(
 
 def skip(store: StateStore, sku: str, reason: str) -> None:
     store.update(sku, status="skipped", skip_reason=reason)
+
+
+def prepare_work_item_from_url(cfg: AppConfig, key: str, url: str) -> WorkItem:
+    """Download a remote image URL and build a WorkItem for inline generation."""
+    path = download_first_image_url([url], cfg.download_cache_dir)
+    if not path:
+        raise FileNotFoundError(f"Could not download reference image from {url}")
+    return prepare_work_item_for_path(cfg, key, path)
+
+
+def generate_single_replacement(
+    cfg: AppConfig,
+    client: GenAiImageClient,
+    work: WorkItem,
+    *,
+    attempt: int = 1,
+    prompt_style: str = "product",
+    extra_context: str = "",
+    prompt_override: str | None = None,
+    output_suffix: str = "replacement",
+) -> tuple[Path, dict]:
+    """
+    Generate a single replacement image (product or lifestyle style) for Shopify review.
+    Saves to outputs/_temp/{key}/{output_suffix}_attempt{N}.{ext}
+    """
+    temp_dir = _temp_dir(cfg, work.key)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    out_path = temp_dir / f"{output_suffix}_attempt{attempt}.{cfg.output_format}"
+
+    ctx = ""
+    if extra_context.strip():
+        ctx = f"PRODUCT CONTEXT (must be consistent):\n{extra_context.strip()}\n\n"
+    if prompt_override and prompt_override.strip():
+        body = prompt_override.strip()
+    else:
+        body = PROMPT_2 if prompt_style == "product" else PROMPT_1
+    prompt = ctx + body.strip() + METAL_GUARDRAIL_SUFFIX
+
+    img, meta = client.generate_image_with_meta(work.reference_rgbs, prompt)
+
+    result_meta: dict = {
+        "attempt": attempt,
+        "prompt_style": prompt_style,
+        "prompt_body": body,
+        "auto_rejected": False,
+        "quality": {},
+        "prompt_meta": meta,
+    }
+
+    if cfg.quality_guard_enabled:
+        ref0 = work.reference_rgbs[0]
+        q = check_similarity(ref0, img, cfg.quality_luma_corr_threshold, cfg.quality_edge_corr_threshold)
+        result_meta["quality"] = q.__dict__
+        if not q.ok:
+            result_meta["auto_rejected"] = True
+
+    img.save(out_path)
+    return out_path, result_meta

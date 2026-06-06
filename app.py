@@ -14,13 +14,17 @@ from PIL import Image
 from src.config import load_config
 from src.genai_client import GenAiImageClient
 from src.pipeline import (
+    PROMPT_1,
+    PROMPT_2,
     generate_pair,
+    generate_single_replacement,
     write_missing_report,
     approve_many,
     skip,
     load_entries_and_state,
     prepare_work_item_for_path,
     prepare_work_item_for_paths,
+    prepare_work_item_from_url,
 )
 from src.folder_ingest import iter_groups
 from src.name_group import base_key_from_path
@@ -34,6 +38,8 @@ from src.shopify_client import ShopifyClient, ShopifyConfig
 from src.shopify_token_cache import load_cached_token, save_cached_token, CachedToken
 from src.shopify_settings import load_shopify_settings, save_shopify_settings, ShopifySettings
 from src.drive_client import ensure_client_secret_saved, get_drive_service, list_videos_for_sku, download_file_to_cache
+from src.title_prompts import TITLE_CATEGORIES
+from src.title_generator import fetch_products_for_quotas, generate_title_from_image
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +129,127 @@ def _bordered_container():
     except TypeError:
         with st.container():
             yield
+
+
+def _strip_html(html: str, max_len: int = 500) -> str:
+    text = re.sub(r"<[^>]+>", " ", html or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def _render_shopify_connection_sidebar(cfg) -> None:
+    """Shared Shopify connection controls for Upload and Shopify Review tabs."""
+    with st.sidebar:
+        st.subheader("Shopify")
+        settings_path = cfg.outputs_dir / ".shopify_settings.json"
+        saved = load_shopify_settings(settings_path)
+        if saved:
+            st.session_state.setdefault("shopify_domain", saved.shop_domain)
+            st.session_state.setdefault("shopify_client_id", saved.client_id)
+            st.session_state.setdefault("shopify_api_version", saved.api_version)
+        sd = st.text_input("Shop domain", value=st.session_state.get("shopify_domain", ""), placeholder="yourstore.myshopify.com")
+        client_id = st.text_input("Client ID", value=st.session_state.get("shopify_client_id", ""), type="password")
+        client_secret = st.text_input("Client secret", value=st.session_state.get("shopify_client_secret", ""), type="password")
+        tok = st.text_input(
+            "Access token (optional)",
+            value=st.session_state.get("shopify_token", ""),
+            type="password",
+            help="If empty, click 'Get access token' to request one using Client ID/secret (client credentials grant).",
+        )
+        api_ver = st.text_input("API version", value=st.session_state.get("shopify_api_version", "2024-01"))
+        st.session_state.shopify_domain = sd
+        st.session_state.shopify_client_id = client_id
+        st.session_state.shopify_client_secret = client_secret
+        st.session_state.shopify_token = tok
+        st.session_state.shopify_api_version = api_ver
+
+        cache_path = cfg.outputs_dir / ".shopify_token_cache.json"
+        cache_key = f"{sd}|{client_id}"
+        cached = load_cached_token(cache_path, cache_key) if (sd and client_id) else None
+        if cached and not tok.strip():
+            st.session_state.shopify_token = cached.access_token
+            tok = cached.access_token
+        if cached:
+            st.caption(f"Cached token valid for ~{int((cached.expires_at_epoch - time.time()) // 60)} min")
+
+        if sd.strip():
+            try:
+                save_shopify_settings(
+                    settings_path,
+                    ShopifySettings(shop_domain=sd.strip(), client_id=client_id.strip(), api_version=(api_ver.strip() or "2024-01")),
+                )
+            except Exception:
+                pass
+
+        if st.button("Get access token", width="stretch", disabled=not (sd and client_id and client_secret)):
+            try:
+                data = ShopifyClient.oauth_token_client_credentials(shop_domain=sd, client_id=client_id, client_secret=client_secret)
+                access_token = str(data.get("access_token") or "")
+                expires_in = int(data.get("expires_in") or 0)
+                scope = str(data.get("scope") or "")
+                if not access_token:
+                    raise RuntimeError(f"Token response missing access_token: {data}")
+                st.session_state.shopify_token = access_token
+                save_cached_token(
+                    cache_path,
+                    cache_key,
+                    CachedToken(access_token=access_token, expires_at_epoch=time.time() + float(expires_in or 0), scope=scope),
+                )
+                st.success("Access token acquired and cached locally.")
+            except Exception as e:
+                st.error("Failed to get access token.")
+                st.exception(e)
+
+        if st.button("Test Shopify connection", width="stretch", disabled=not (sd and (tok or cached))):
+            try:
+                token_to_use = tok.strip() if tok.strip() else (cached.access_token if cached else "")
+                name = ShopifyClient(ShopifyConfig(shop_domain=sd, admin_access_token=token_to_use, api_version=api_ver)).ping()
+                st.success(f"Connected: {name}")
+            except Exception as e:
+                st.error("Shopify connection failed.")
+                st.exception(e)
+
+
+def _shopify_client_from_session(cfg) -> ShopifyClient | None:
+    sd = str(st.session_state.get("shopify_domain") or "").strip()
+    api_ver = str(st.session_state.get("shopify_api_version") or "2024-01").strip() or "2024-01"
+    tok = str(st.session_state.get("shopify_token") or "").strip()
+    client_id = str(st.session_state.get("shopify_client_id") or "").strip()
+    if not sd:
+        return None
+    if not tok and client_id:
+        cache_path = cfg.outputs_dir / ".shopify_token_cache.json"
+        cached = load_cached_token(cache_path, f"{sd}|{client_id}")
+        if cached:
+            tok = cached.access_token
+    if not tok:
+        return None
+    return ShopifyClient(ShopifyConfig(shop_domain=sd, admin_access_token=tok, api_version=api_ver))
+
+
+def _ensure_genai_client(cfg) -> GenAiImageClient:
+    if "client" not in st.session_state:
+        st.session_state.selected_model = "models/gemini-3.1-flash-image-preview"
+        st.session_state.client = GenAiImageClient(
+            st.session_state.selected_model,
+            cfg.min_seconds_between_requests,
+            semaphore_dir=str(cfg.outputs_dir / "_semaphore"),
+            max_inflight_generations=int(getattr(cfg, "max_inflight_generations", 4) or 4),
+        )
+    return st.session_state.client
+
+
+def _build_shopify_product_query(*, search: str, status: str, product_type: str) -> str | None:
+    parts: list[str] = []
+    if search.strip():
+        parts.append(search.strip())
+    if status and status != "ALL":
+        parts.append(f"status:{status.lower()}")
+    if product_type.strip():
+        parts.append(f"product_type:{product_type.strip()}")
+    return " ".join(parts) if parts else None
 
 
 def _read_state(path: Path) -> dict:
@@ -621,6 +748,517 @@ def _render_gallery(cfg) -> None:
                         st.warning("Missing prompt2 output")
 
 
+def _render_shopify_review(cfg) -> None:
+    st.subheader("Shopify Inventory Review")
+    st.caption("Browse live Shopify products, view all images per product, and delete or replace images inline.")
+
+    _render_shopify_connection_sidebar(cfg)
+    client = _shopify_client_from_session(cfg)
+    if client is None:
+        st.warning("Connect Shopify in the sidebar (domain + token), then return here.")
+        return
+
+    with st.sidebar:
+        st.divider()
+        st.subheader("Generation")
+        gen_client = _ensure_genai_client(cfg)
+        st.caption(f"Model: {getattr(gen_client, 'model', cfg.model)}")
+
+    f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
+    with f1:
+        search = st.text_input("Search", value=st.session_state.get("shopify_review_search", ""), placeholder="title, SKU, handle...")
+        st.session_state.shopify_review_search = search
+    with f2:
+        status = st.selectbox("Status", ["ALL", "ACTIVE", "DRAFT", "ARCHIVED"], index=0, key="shopify_review_status")
+    with f3:
+        product_type_filter = st.text_input("Product type", value=st.session_state.get("shopify_review_product_type", ""))
+        st.session_state.shopify_review_product_type = product_type_filter
+    with f4:
+        page_size = st.selectbox("Per page", [5, 10, 15, 20], index=1, key="shopify_review_page_size")
+
+    filter_key = f"{search}|{status}|{product_type_filter}|{page_size}"
+    if st.session_state.get("shopify_review_filter_key") != filter_key:
+        st.session_state.shopify_review_filter_key = filter_key
+        st.session_state.shopify_review_cursors = [None]
+        st.session_state.shopify_review_page_idx = 0
+
+    if "shopify_review_cursors" not in st.session_state:
+        st.session_state.shopify_review_cursors = [None]
+    if "shopify_review_page_idx" not in st.session_state:
+        st.session_state.shopify_review_page_idx = 0
+
+    cursors: list = st.session_state.shopify_review_cursors
+    page_idx = int(st.session_state.shopify_review_page_idx)
+    after_cursor = cursors[page_idx] if page_idx < len(cursors) else None
+
+    query = _build_shopify_product_query(search=search, status=status, product_type=product_type_filter)
+
+    try:
+        result = client.list_products(first=int(page_size), after=after_cursor, query=query)
+    except Exception as e:
+        st.error("Failed to fetch products from Shopify.")
+        st.exception(e)
+        return
+
+    products = result.get("products") or []
+    page_info = result.get("pageInfo") or {}
+    has_next = bool(page_info.get("hasNextPage"))
+    if has_next:
+        end_cursor = str(page_info.get("endCursor") or "")
+        if end_cursor and page_idx + 1 >= len(cursors):
+            cursors.append(end_cursor)
+            st.session_state.shopify_review_cursors = cursors
+
+    nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 3])
+    with nav1:
+        if st.button("Refresh", width="stretch"):
+            st.session_state.shopify_review_refresh = int(st.session_state.get("shopify_review_refresh", 0)) + 1
+            st.rerun()
+    with nav2:
+        if st.button("Previous", width="stretch", disabled=page_idx <= 0):
+            st.session_state.shopify_review_page_idx = max(0, page_idx - 1)
+            st.rerun()
+    with nav3:
+        if st.button("Next", width="stretch", disabled=not has_next):
+            st.session_state.shopify_review_page_idx = page_idx + 1
+            st.rerun()
+    with nav4:
+        st.caption(f"Page {page_idx + 1} — {len(products)} product(s)")
+
+    if not products:
+        st.info("No products found for the current filters.")
+        return
+
+    st.caption(f"Showing {len(products)} product(s) on this page.")
+
+    gen_client = _ensure_genai_client(cfg)
+
+    for prod in products:
+        product_id = str(prod.get("id") or "")
+        title = str(prod.get("title") or "")
+        category = str(prod.get("category") or prod.get("product_type") or "")
+        description = _strip_html(str(prod.get("description_html") or ""), max_len=800)
+        handle = str(prod.get("handle") or "")
+        skus = prod.get("skus") or []
+        media = prod.get("media") or []
+
+        with _bordered_container():
+            header = st.columns([4, 1])
+            with header[0]:
+                st.markdown(f"### {title}")
+                sku_text = ", ".join(skus) if skus else "—"
+                st.caption(f"Category: `{category}` | Handle: `{handle}` | SKU: `{sku_text}` | Status: `{prod.get('status', '')}`")
+            with header[1]:
+                st.caption(f"{len(media)} image(s)")
+
+            if description:
+                st.markdown(description)
+            else:
+                st.caption("No description.")
+
+            if not media:
+                st.warning("No images on this product.")
+                continue
+
+            for idx, m in enumerate(media):
+                media_id = str(m.get("id") or "")
+                media_url = str(m.get("url") or "")
+                media_alt = str(m.get("alt") or "")
+                if not media_id:
+                    continue
+
+                repl_key = f"review_replacement::{product_id}::{media_id}"
+                action_key = f"{product_id}::{media_id}"
+
+                st.markdown("---")
+                img_col, act_col = st.columns([1, 2])
+                with img_col:
+                    st.caption(f"Image {idx + 1}" + (f" — {media_alt}" if media_alt else ""))
+                    if media_url:
+                        st.image(media_url, width=220)
+                    else:
+                        st.warning("Image URL unavailable")
+
+                with act_col:
+                    style = st.radio(
+                        "Replacement style",
+                        ["product", "lifestyle"],
+                        horizontal=True,
+                        key=f"style::{action_key}",
+                        format_func=lambda x: "Product shot" if x == "product" else "Lifestyle",
+                    )
+                    prompt_state_key = f"prompt::{action_key}"
+                    style_cache_key = f"prompt_style_cache::{action_key}"
+                    default_prompt = PROMPT_2 if style == "product" else PROMPT_1
+                    if st.session_state.get(style_cache_key) != style:
+                        st.session_state[prompt_state_key] = default_prompt
+                        st.session_state[style_cache_key] = style
+                    if prompt_state_key not in st.session_state:
+                        st.session_state[prompt_state_key] = default_prompt
+                    prompt_override = st.text_area(
+                        "Prompt (editable for this generation only)",
+                        key=prompt_state_key,
+                        height=120,
+                    )
+                    reset_cols = st.columns([1, 3])
+                    with reset_cols[0]:
+                        if st.button("Reset prompt", key=f"reset_prompt::{action_key}"):
+                            st.session_state[prompt_state_key] = default_prompt
+                            st.rerun()
+                    btn_cols = st.columns(3)
+                    with btn_cols[0]:
+                        if st.button("Delete", key=f"del::{action_key}", type="secondary"):
+                            try:
+                                with st.spinner("Deleting image..."):
+                                    client.delete_product_media(product_id=product_id, media_ids=[media_id])
+                                if repl_key in st.session_state:
+                                    del st.session_state[repl_key]
+                                st.success("Image deleted.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error("Delete failed.")
+                                st.exception(e)
+                    with btn_cols[1]:
+                        if st.button("Generate replacement", key=f"gen::{action_key}", type="primary"):
+                            if not media_url:
+                                st.error("Cannot generate: image URL missing.")
+                            else:
+                                try:
+                                    work_key = f"review_{handle or product_id}_{media_id[-8:]}"
+                                    extra = f"Product title: {title}\nCategory: {category}"
+                                    with st.spinner("Generating replacement image..."):
+                                        work = prepare_work_item_from_url(cfg, work_key, media_url)
+                                        out_path, meta = generate_single_replacement(
+                                            cfg,
+                                            gen_client,
+                                            work,
+                                            attempt=1,
+                                            prompt_style=style,
+                                            extra_context=extra,
+                                            prompt_override=prompt_override,
+                                            output_suffix=f"replace_{idx}",
+                                        )
+                                    st.session_state[repl_key] = {"path": str(out_path), "meta": meta, "style": style}
+                                    st.success("Replacement generated. Review below, then click Replace in Shopify.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error("Generation failed.")
+                                    st.exception(e)
+                    with btn_cols[2]:
+                        repl = st.session_state.get(repl_key)
+                        replace_disabled = not (isinstance(repl, dict) and repl.get("path") and Path(str(repl["path"])).exists())
+                        if st.button("Replace in Shopify", key=f"replace::{action_key}", disabled=replace_disabled):
+                            repl_path = Path(str(repl["path"]))
+                            try:
+                                mime = "image/jpeg" if repl_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+                                with st.spinner("Uploading replacement and removing old image..."):
+                                    client.replace_product_image(
+                                        product_id=product_id,
+                                        old_media_id=media_id,
+                                        file_bytes=repl_path.read_bytes(),
+                                        filename=repl_path.name,
+                                        mime_type=mime,
+                                        alt=media_alt or title,
+                                    )
+                                if repl_key in st.session_state:
+                                    del st.session_state[repl_key]
+                                st.success("Image replaced in Shopify.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error("Replace failed.")
+                                st.exception(e)
+
+                repl = st.session_state.get(repl_key)
+                if isinstance(repl, dict) and repl.get("path"):
+                    repl_path = Path(str(repl["path"]))
+                    if repl_path.exists():
+                        st.caption(f"Generated candidate ({repl.get('style', 'product')})")
+                        st.image(_load_image(repl_path), width=220)
+
+
+def _log_title_generation_cost(
+    cfg,
+    *,
+    key: str,
+    model: str,
+    cost: float,
+    status: str = "success",
+    error: str = "",
+) -> None:
+    try:
+        append_cost_row(
+            cfg.cost_log_csv,
+            make_generate_row(
+                key=key,
+                ref_tag="",
+                prompt_id="vision_title",
+                attempt=0,
+                model=model,
+                mode="devapi",
+                status=status,
+                action="ai_meta",
+                usage_metadata=None,
+                response_id="",
+                model_version="",
+                estimated_cost_usd=f"{cost:.6f}" if cost else "",
+                error=error,
+            ),
+        )
+    except Exception:
+        pass
+
+
+def _render_title_generator(cfg) -> None:
+    st.subheader("Title Generator")
+    st.caption("Generate image-based product titles from live Shopify inventory, review them, then bulk-update Shopify.")
+
+    _render_shopify_connection_sidebar(cfg)
+    client = _shopify_client_from_session(cfg)
+    if client is None:
+        st.warning("Connect Shopify in the sidebar (domain + token), then return here.")
+        return
+
+    try:
+        import pandas as pd
+    except Exception:
+        st.error("Missing pandas dependency; reinstall requirements.")
+        return
+
+    model = "models/gemini-2.5-flash"
+
+    with st.expander("Category quotas", expanded=True):
+        quota_cols = st.columns(4)
+        quotas: dict[str, int] = {}
+        for i, cat in enumerate(TITLE_CATEGORIES):
+            with quota_cols[i % 4]:
+                quotas[cat] = int(
+                    st.number_input(
+                        cat.title(),
+                        min_value=0,
+                        max_value=50,
+                        value=int(st.session_state.get(f"title_quota_{cat}", 0) or 0),
+                        key=f"title_quota_{cat}",
+                    )
+                )
+
+    f1, f2 = st.columns([2, 1])
+    with f1:
+        search = st.text_input("Shopify search filter (optional)", value=st.session_state.get("title_gen_search", ""))
+        st.session_state.title_gen_search = search
+    with f2:
+        status = st.selectbox("Status", ["ACTIVE", "DRAFT", "ARCHIVED", "ALL"], index=0, key="title_gen_status")
+
+    query_parts: list[str] = []
+    if search.strip():
+        query_parts.append(search.strip())
+    if status != "ALL":
+        query_parts.append(f"status:{status.lower()}")
+    shopify_query = " ".join(query_parts) if query_parts else None
+
+    total_requested = sum(quotas.values())
+    action_cols = st.columns([1, 1, 2])
+    with action_cols[0]:
+        select_clicked = st.button("Select products", type="secondary", disabled=total_requested <= 0)
+    with action_cols[1]:
+        generate_clicked = st.button("Generate titles", type="primary", disabled=total_requested <= 0)
+    with action_cols[2]:
+        st.caption(f"Requested total: {total_requested}")
+
+    if select_clicked:
+        with st.spinner("Scanning Shopify catalog for category quotas..."):
+            selected, remaining = fetch_products_for_quotas(client, quotas, query=shopify_query)
+        rows = []
+        for prod in selected:
+            rows.append(
+                {
+                    "selected": True,
+                    "product_id": prod.get("id", ""),
+                    "sku": prod.get("sku", ""),
+                    "category": prod.get("canonical_category", ""),
+                    "current_title": prod.get("title", ""),
+                    "generated_title": "",
+                    "new_title": "",
+                    "cost_usd": "",
+                    "status": "selected",
+                    "image_url": prod.get("primary_image_url", ""),
+                    "product_type": prod.get("product_type", ""),
+                }
+            )
+        st.session_state.title_gen_rows = rows
+        st.session_state.title_gen_remaining = remaining
+        st.session_state.title_gen_version = int(st.session_state.get("title_gen_version", 0)) + 1
+        if not rows:
+            st.warning("No matching products with images were found for the requested quotas.")
+        else:
+            unfilled = {k: v for k, v in (remaining or {}).items() if int(v or 0) > 0}
+            if unfilled:
+                st.info(f"Selected {len(rows)} products. Unfilled quotas: {unfilled}")
+            else:
+                st.success(f"Selected {len(rows)} products.")
+
+    if generate_clicked:
+        rows = list(st.session_state.get("title_gen_rows") or [])
+        if not rows:
+            with st.spinner("Selecting products and generating titles..."):
+                selected, remaining = fetch_products_for_quotas(client, quotas, query=shopify_query)
+                st.session_state.title_gen_remaining = remaining
+                rows = [
+                    {
+                        "selected": True,
+                        "product_id": p.get("id", ""),
+                        "sku": p.get("sku", ""),
+                        "category": p.get("canonical_category", ""),
+                        "current_title": p.get("title", ""),
+                        "generated_title": "",
+                        "new_title": "",
+                        "cost_usd": "",
+                        "status": "selected",
+                        "image_url": p.get("primary_image_url", ""),
+                        "product_type": p.get("product_type", ""),
+                    }
+                    for p in selected
+                ]
+        if not rows:
+            st.warning("No products available to generate titles for.")
+        else:
+            progress = st.progress(0.0, text="Generating titles...")
+            for i, row in enumerate(rows):
+                progress.progress((i + 1) / max(1, len(rows)), text=f"Generating {i + 1}/{len(rows)}...")
+                image_url = str(row.get("image_url") or "")
+                if not image_url:
+                    row["status"] = "error: missing image"
+                    continue
+                title, cost, err = generate_title_from_image(
+                    cfg,
+                    image_url=image_url,
+                    category_key=str(row.get("category") or "other"),
+                    cache_dir=cfg.download_cache_dir,
+                    current_title=str(row.get("current_title") or ""),
+                    product_type=str(row.get("product_type") or ""),
+                    sku=str(row.get("sku") or ""),
+                    model=model,
+                )
+                if err:
+                    row["status"] = f"error: {err}"
+                    _log_title_generation_cost(cfg, key=str(row.get("sku") or row.get("product_id") or ""), model=model, cost=0.0, status="error", error=err)
+                else:
+                    row["generated_title"] = title
+                    row["new_title"] = title
+                    row["cost_usd"] = f"{cost:.6f}"
+                    row["status"] = "generated"
+                    _log_title_generation_cost(cfg, key=str(row.get("sku") or row.get("product_id") or ""), model=model, cost=cost)
+            st.session_state.title_gen_rows = rows
+            st.session_state.title_gen_version = int(st.session_state.get("title_gen_version", 0)) + 1
+            st.success(f"Generated titles for {sum(1 for r in rows if r.get('status') == 'generated')} product(s).")
+
+    rows = list(st.session_state.get("title_gen_rows") or [])
+    if not rows:
+        st.info("Set category quotas, then click Select products or Generate titles.")
+        return
+
+    remaining = st.session_state.get("title_gen_remaining") or {}
+    if remaining:
+        unfilled = {k: v for k, v in remaining.items() if int(v or 0) > 0}
+        if unfilled:
+            st.caption(f"Unfilled quotas from last selection: {unfilled}")
+
+    df = pd.DataFrame(rows)
+    display_cols = [
+        "selected",
+        "sku",
+        "category",
+        "current_title",
+        "generated_title",
+        "new_title",
+        "cost_usd",
+        "status",
+        "product_id",
+        "image_url",
+        "product_type",
+    ]
+    for col in display_cols:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[display_cols]
+
+    st.subheader("Review generated titles")
+    edited = st.data_editor(
+        df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "selected": st.column_config.CheckboxColumn("Update?", default=True),
+            "sku": st.column_config.TextColumn("SKU", disabled=True),
+            "category": st.column_config.TextColumn("Category", disabled=True),
+            "current_title": st.column_config.TextColumn("Current title", disabled=True),
+            "generated_title": st.column_config.TextColumn("Generated title", disabled=True),
+            "new_title": st.column_config.TextColumn("Title to apply"),
+            "cost_usd": st.column_config.TextColumn("Cost (USD)", disabled=True),
+            "status": st.column_config.TextColumn("Status", disabled=True),
+            "product_id": None,
+            "image_url": None,
+            "product_type": None,
+        },
+        disabled=["sku", "category", "current_title", "generated_title", "cost_usd", "status"],
+        key=f"title_gen_editor_{int(st.session_state.get('title_gen_version', 0))}",
+    )
+
+    total_cost = 0.0
+    for val in edited.get("cost_usd", []):
+        try:
+            total_cost += float(val or 0.0)
+        except Exception:
+            pass
+    st.caption(f"Total generation cost shown: ${total_cost:.4f}")
+
+    preview_cols = st.columns(min(4, len(edited)))
+    for i, (_, row) in enumerate(edited.head(4).iterrows()):
+        with preview_cols[i % len(preview_cols)]:
+            url = str(row.get("image_url") or "")
+            if url:
+                st.image(url, width=140)
+            st.caption(str(row.get("sku") or ""))
+
+    if st.button("Update selected titles in Shopify", type="primary"):
+        to_update = edited[edited["selected"] == True]  # noqa: E712
+        if to_update.empty:
+            st.warning("No rows selected for update.")
+            return
+
+        ok = 0
+        failed: list[str] = []
+        success_ids: set[str] = set()
+        for _, row in to_update.iterrows():
+            product_id = str(row.get("product_id") or "").strip()
+            new_title = str(row.get("new_title") or "").strip()
+            sku = str(row.get("sku") or product_id)
+            if not product_id or not new_title:
+                failed.append(f"{sku}: missing product_id or title")
+                continue
+            try:
+                with st.spinner(f"Updating {sku}..."):
+                    client.product_update_title(product_id=product_id, title=new_title)
+                ok += 1
+                success_ids.add(product_id)
+            except Exception as e:
+                failed.append(f"{sku}: {e}")
+
+        updated_rows = edited.to_dict(orient="records")
+        for row in updated_rows:
+            pid = str(row.get("product_id") or "")
+            if pid in success_ids:
+                row["current_title"] = str(row.get("new_title") or "")
+                row["status"] = "updated"
+        st.session_state.title_gen_rows = updated_rows
+        st.session_state.title_gen_version = int(st.session_state.get("title_gen_version", 0)) + 1
+
+        st.success(f"Updated {ok} title(s) in Shopify.")
+        if failed:
+            st.error("Some updates failed:")
+            for msg in failed:
+                st.write(f"- {msg}")
+
+
 def _render_costs(cfg) -> None:
     st.subheader("Costs / Calls")
     try:
@@ -678,78 +1316,9 @@ def _render_costs(cfg) -> None:
 def _render_upload(cfg) -> None:
     st.subheader("Upload to Shopify (Queue)")
 
+    _render_shopify_connection_sidebar(cfg)
+
     with st.sidebar:
-        st.subheader("Shopify")
-        settings_path = cfg.outputs_dir / ".shopify_settings.json"
-        saved = load_shopify_settings(settings_path)
-        if saved:
-            st.session_state.setdefault("shopify_domain", saved.shop_domain)
-            st.session_state.setdefault("shopify_client_id", saved.client_id)
-            st.session_state.setdefault("shopify_api_version", saved.api_version)
-        sd = st.text_input("Shop domain", value=st.session_state.get("shopify_domain", ""), placeholder="yourstore.myshopify.com")
-        client_id = st.text_input("Client ID", value=st.session_state.get("shopify_client_id", ""), type="password")
-        client_secret = st.text_input("Client secret", value=st.session_state.get("shopify_client_secret", ""), type="password")
-        tok = st.text_input(
-            "Access token (optional)",
-            value=st.session_state.get("shopify_token", ""),
-            type="password",
-            help="If empty, click 'Get access token' to request one using Client ID/secret (client credentials grant).",
-        )
-        api_ver = st.text_input("API version", value=st.session_state.get("shopify_api_version", "2024-01"))
-        st.session_state.shopify_domain = sd
-        st.session_state.shopify_client_id = client_id
-        st.session_state.shopify_client_secret = client_secret
-        st.session_state.shopify_token = tok
-        st.session_state.shopify_api_version = api_ver
-
-        cache_path = cfg.outputs_dir / ".shopify_token_cache.json"
-        cache_key = f"{sd}|{client_id}"
-        cached = load_cached_token(cache_path, cache_key) if (sd and client_id) else None
-        if cached and not tok.strip():
-            # Auto-populate if we have a valid cached token (expires ~23h).
-            st.session_state.shopify_token = cached.access_token
-            tok = cached.access_token
-        if cached:
-            st.caption(f"Cached token valid for ~{int((cached.expires_at_epoch - time.time())//60)} min")
-
-        # Persist settings (domain + client id + api version) so reload doesn't require re-entry.
-        if sd.strip():
-            try:
-                save_shopify_settings(
-                    settings_path,
-                    ShopifySettings(shop_domain=sd.strip(), client_id=client_id.strip(), api_version=(api_ver.strip() or "2024-01")),
-                )
-            except Exception:
-                pass
-
-        if st.button("Get access token", width="stretch", disabled=not (sd and client_id and client_secret)):
-            try:
-                data = ShopifyClient.oauth_token_client_credentials(shop_domain=sd, client_id=client_id, client_secret=client_secret)
-                access_token = str(data.get("access_token") or "")
-                expires_in = int(data.get("expires_in") or 0)
-                scope = str(data.get("scope") or "")
-                if not access_token:
-                    raise RuntimeError(f"Token response missing access_token: {data}")
-                st.session_state.shopify_token = access_token
-                save_cached_token(
-                    cache_path,
-                    cache_key,
-                    CachedToken(access_token=access_token, expires_at_epoch=time.time() + float(expires_in or 0), scope=scope),
-                )
-                st.success("Access token acquired and cached locally.")
-            except Exception as e:
-                st.error("Failed to get access token.")
-                st.exception(e)
-
-        if st.button("Test Shopify connection", width="stretch", disabled=not (sd and (tok or cached))):
-            try:
-                token_to_use = tok.strip() if tok.strip() else (cached.access_token if cached else "")
-                name = ShopifyClient(ShopifyConfig(shop_domain=sd, admin_access_token=token_to_use, api_version=api_ver)).ping()
-                st.success(f"Connected: {name}")
-            except Exception as e:
-                st.error("Shopify connection failed.")
-                st.exception(e)
-
         st.divider()
         st.subheader("Google Drive (videos)")
         gdrive_folder_id = st.text_input("Drive folder ID", value=st.session_state.get("gdrive_folder_id", ""))
@@ -2163,7 +2732,7 @@ def main() -> None:
     except Exception:
         pass
 
-    nav_options = ["Upload", "Bulk Upload", "Generate", "Gallery", "Costs"]
+    nav_options = ["Upload", "Bulk Upload", "Generate", "Gallery", "Shopify Review", "Title Generator", "Costs"]
     if "nav_widget" not in st.session_state:
         st.session_state.nav_widget = "Upload"
     if "pending_nav" in st.session_state:
@@ -2186,6 +2755,10 @@ def main() -> None:
         _render_bulk_upload(cfg)
     elif st.session_state.view == "Gallery":
         _render_gallery(cfg)
+    elif st.session_state.view == "Shopify Review":
+        _render_shopify_review(cfg)
+    elif st.session_state.view == "Title Generator":
+        _render_title_generator(cfg)
     elif st.session_state.view == "Costs":
         _render_costs(cfg)
     else:

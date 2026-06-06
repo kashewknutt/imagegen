@@ -235,6 +235,28 @@ class ShopifyClient:
             )
         return [x for x in out if x.get("namespace") and x.get("key") and x.get("type")]
 
+    def product_update_title(self, *, product_id: str, title: str) -> dict[str, str]:
+        """Update a product's title via productUpdate."""
+        mutation = """
+        mutation ProductUpdateTitle($input: ProductInput!) {
+          productUpdate(input: $input) {
+            product { id title handle }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"input": {"id": product_id, "title": title}})
+        payload = data.get("productUpdate") or {}
+        errs = payload.get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"productUpdate userErrors: {errs}")
+        prod = payload.get("product") or {}
+        return {
+            "id": str(prod.get("id") or product_id),
+            "title": str(prod.get("title") or title),
+            "handle": str(prod.get("handle") or ""),
+        }
+
     def product_update_metafields(self, *, product_id: str, metafields: list[dict[str, str]]) -> None:
         """
         Sets metafields on a product using productUpdate. Each metafield item must include:
@@ -493,3 +515,209 @@ class ShopifyClient:
             "rules": [{"column": "TYPE", "relation": "EQUALS", "condition": product_type}],
         }
         return self.collection_create(title=title, handle=handle, rule_set=rule_set)
+
+    def list_products(
+        self,
+        *,
+        first: int = 10,
+        after: str | None = None,
+        query: str | None = None,
+        media_first: int = 50,
+    ) -> dict[str, Any]:
+        """
+        List products with metadata and media for inventory review.
+        Returns: {products: [...], pageInfo: {hasNextPage, hasPreviousPage, startCursor, endCursor}}
+        """
+        gql = """
+        query ListProducts($first: Int!, $after: String, $query: String, $mediaFirst: Int!) {
+          products(first: $first, after: $after, query: $query) {
+            pageInfo {
+              hasNextPage
+              hasPreviousPage
+              startCursor
+              endCursor
+            }
+            edges {
+              cursor
+              node {
+                id
+                title
+                handle
+                descriptionHtml
+                productType
+                status
+                category { fullName name }
+                featuredImage { url altText }
+                media(first: $mediaFirst) {
+                  edges {
+                    node {
+                      ... on MediaImage {
+                        id
+                        alt
+                        mediaContentType
+                        status
+                        image { url altText }
+                      }
+                    }
+                  }
+                }
+                variants(first: 5) {
+                  edges { node { sku } }
+                }
+              }
+            }
+          }
+        }
+        """
+        variables: dict[str, Any] = {"first": int(first), "mediaFirst": int(media_first)}
+        if after:
+            variables["after"] = after
+        if query:
+            variables["query"] = query
+        data = self.graphql(gql, variables)
+        payload = data.get("products") or {}
+        page_info = payload.get("pageInfo") or {}
+        products: list[dict[str, Any]] = []
+        for edge in (payload.get("edges") or []):
+            node = edge.get("node") or {}
+            media_items: list[dict[str, str]] = []
+            for me in ((node.get("media") or {}).get("edges") or []):
+                mnode = me.get("node") or {}
+                mid = str(mnode.get("id") or "")
+                if not mid:
+                    continue
+                img = mnode.get("image") or {}
+                url = ""
+                if isinstance(img, dict):
+                    url = str(img.get("url") or "")
+                media_items.append(
+                    {
+                        "id": mid,
+                        "url": url,
+                        "alt": str(mnode.get("alt") or ""),
+                        "status": str(mnode.get("status") or ""),
+                        "content_type": str(mnode.get("mediaContentType") or "IMAGE"),
+                    }
+                )
+            skus: list[str] = []
+            for ve in ((node.get("variants") or {}).get("edges") or []):
+                sku = str(((ve.get("node") or {}).get("sku") or "")).strip()
+                if sku:
+                    skus.append(sku)
+            cat = node.get("category") or {}
+            category_name = ""
+            if isinstance(cat, dict):
+                category_name = str(cat.get("fullName") or cat.get("name") or "")
+            feat = node.get("featuredImage") or {}
+            featured_url = ""
+            if isinstance(feat, dict):
+                featured_url = str(feat.get("url") or "")
+            product_type = str(node.get("productType") or "")
+            title = str(node.get("title") or "")
+            primary_image_url = featured_url
+            if not primary_image_url:
+                for m in media_items:
+                    if str(m.get("url") or "").strip():
+                        primary_image_url = str(m.get("url") or "")
+                        break
+            products.append(
+                {
+                    "id": str(node.get("id") or ""),
+                    "title": title,
+                    "handle": str(node.get("handle") or ""),
+                    "description_html": str(node.get("descriptionHtml") or ""),
+                    "product_type": product_type,
+                    "status": str(node.get("status") or ""),
+                    "category": category_name,
+                    "featured_image_url": featured_url,
+                    "primary_image_url": primary_image_url,
+                    "skus": skus,
+                    "sku": str(skus[0] if skus else ""),
+                    "media": media_items,
+                    "cursor": str(edge.get("cursor") or ""),
+                }
+            )
+        return {
+            "products": products,
+            "pageInfo": {
+                "hasNextPage": bool(page_info.get("hasNextPage")),
+                "hasPreviousPage": bool(page_info.get("hasPreviousPage")),
+                "startCursor": str(page_info.get("startCursor") or ""),
+                "endCursor": str(page_info.get("endCursor") or ""),
+            },
+        }
+
+    def delete_product_media(self, *, product_id: str, media_ids: list[str]) -> list[str]:
+        """Delete one or more media items from a product. Returns deleted media IDs."""
+        if not media_ids:
+            return []
+        mutation = """
+        mutation ProductDeleteMedia($productId: ID!, $mediaIds: [ID!]!) {
+          productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
+            deletedMediaIds
+            mediaUserErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"productId": product_id, "mediaIds": media_ids})
+        payload = data.get("productDeleteMedia") or {}
+        errs = payload.get("mediaUserErrors") or []
+        if errs:
+            raise RuntimeError(f"productDeleteMedia userErrors: {errs}")
+        return [str(x) for x in (payload.get("deletedMediaIds") or [])]
+
+    def upload_image_bytes(
+        self,
+        *,
+        file_bytes: bytes,
+        filename: str,
+        mime_type: str = "image/jpeg",
+        alt: str = "",
+        max_poll_tries: int = 30,
+        poll_sleep_seconds: float = 2.0,
+    ) -> str:
+        """
+        Stage-upload image bytes, create a Shopify file, poll until READY, and return CDN URL.
+        """
+        target = self.staged_upload_create(filename=filename, mime_type=mime_type, resource="FILE", http_method="POST")
+        self.upload_to_staged_target(target=target, filename=filename, mime_type=mime_type, file_bytes=file_bytes)
+        resource_url = str(target.get("resourceUrl") or target.get("url") or "")
+        if not resource_url:
+            raise RuntimeError(f"staged upload missing resourceUrl: {target}")
+        file_id = self.file_create_from_staged(resource_url=resource_url, alt=alt, content_type="IMAGE")
+        ready = self.file_poll_ready(file_id=file_id, max_tries=max_poll_tries, sleep_seconds=poll_sleep_seconds)
+        cdn = str(ready.get("preview_url") or "").strip()
+        if not cdn:
+            raise RuntimeError(f"File did not become READY: {ready}")
+        return cdn
+
+    def attach_product_image(self, *, product_id: str, image_url: str, alt: str = "") -> list[dict[str, str]]:
+        """Attach an existing CDN URL as product media."""
+        return self.product_create_media(
+            product_id=product_id,
+            media=[{"mediaContentType": "IMAGE", "originalSource": image_url, "alt": alt}],
+        )
+
+    def replace_product_image(
+        self,
+        *,
+        product_id: str,
+        old_media_id: str,
+        file_bytes: bytes,
+        filename: str,
+        mime_type: str = "image/jpeg",
+        alt: str = "",
+    ) -> dict[str, Any]:
+        """
+        Upload new image, attach to product, then delete old media.
+        Upload-first avoids leaving the product without images if attach fails.
+        """
+        cdn_url = self.upload_image_bytes(
+            file_bytes=file_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            alt=alt,
+        )
+        attached = self.attach_product_image(product_id=product_id, image_url=cdn_url, alt=alt)
+        deleted = self.delete_product_media(product_id=product_id, media_ids=[old_media_id])
+        return {"cdn_url": cdn_url, "attached": attached, "deleted_media_ids": deleted}
