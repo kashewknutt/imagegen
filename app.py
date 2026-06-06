@@ -1050,6 +1050,14 @@ def _title_gen_cost_summary(cfg, *, catalog: list[dict], store: TitleStore) -> d
     }
 
 
+def _title_row_pending(row: dict, store: TitleStore) -> bool:
+    """True when this product has no locally saved generated title yet."""
+    key = str(row.get("key") or "")
+    saved = store.get(key) if key else {}
+    generated = str(row.get("generated_title") or saved.get("generated_title") or "").strip()
+    return not generated
+
+
 def _title_product_row(prod: dict, store: TitleStore) -> dict:
     key = TitleStore.row_key(sku=str(prod.get("sku") or ""), product_id=str(prod.get("id") or ""))
     saved = store.get(key)
@@ -1218,7 +1226,11 @@ def _render_title_generator(cfg) -> None:
     with top_cols[1]:
         load_quota_clicked = st.button("Load quota sample", disabled=sum(quotas.values()) <= 0)
     with top_cols[2]:
-        generate_all_clicked = st.button("Generate all titles")
+        pending_count = sum(1 for r in (st.session_state.get("title_gen_catalog") or []) if _title_row_pending(r, store))
+        generate_all_clicked = st.button(
+            f"Generate pending titles ({pending_count})",
+            disabled=pending_count <= 0,
+        )
     with top_cols[3]:
         save_local_clicked = st.button("Save local edits")
     with top_cols[4]:
@@ -1254,18 +1266,29 @@ def _render_title_generator(cfg) -> None:
         return
 
     if generate_all_clicked:
-        progress = st.progress(0.0, text="Generating titles for all products...")
-        batch_cost = 0.0
-        for i, row in enumerate(catalog):
-            progress.progress((i + 1) / max(1, len(catalog)), text=f"Generating {i + 1}/{len(catalog)}...")
-            _, run_cost = _title_generate_for_row(cfg, row=row, store=store, model=model)
-            batch_cost += run_cost
-        st.session_state.title_gen_catalog = catalog
-        st.success(
-            f"Generated titles for {sum(1 for r in catalog if r.get('status') == 'generated')} product(s). "
-            f"Batch cost: ${batch_cost:.4f}"
-        )
-        st.rerun()
+        pending_rows = [r for r in catalog if _title_row_pending(r, store)]
+        if not pending_rows:
+            st.info("All products already have generated titles.")
+        else:
+            progress = st.progress(0.0, text="Generating titles for pending products...")
+            batch_cost = 0.0
+            generated_n = 0
+            for i, row in enumerate(pending_rows):
+                progress.progress(
+                    (i + 1) / max(1, len(pending_rows)),
+                    text=f"Generating pending {i + 1}/{len(pending_rows)}...",
+                )
+                row, run_cost = _title_generate_for_row(cfg, row=row, store=store, model=model)
+                batch_cost += run_cost
+                if row.get("status") == "generated":
+                    generated_n += 1
+            st.session_state.title_gen_catalog = catalog
+            st.success(
+                f"Generated titles for {generated_n} pending product(s). "
+                f"Skipped {len(catalog) - len(pending_rows)} already generated. "
+                f"Batch cost: ${batch_cost:.4f}"
+            )
+            st.rerun()
 
     if save_local_clicked:
         _title_sync_inputs_to_store(store, catalog)
@@ -1317,10 +1340,11 @@ def _render_title_generator(cfg) -> None:
             st.caption(f"Unfilled quotas from last sample load: {unfilled}")
 
     generated_count = sum(1 for r in catalog if str(r.get("generated_title") or "").strip())
+    pending_count = sum(1 for r in catalog if _title_row_pending(r, store))
     cost_summary = _title_gen_cost_summary(cfg, catalog=catalog, store=store)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Products loaded", len(catalog))
-    m2.metric("With generated titles", generated_count)
+    m2.metric("Pending titles", pending_count)
     m3.metric("Catalog gen cost (USD)", f"${cost_summary['catalog_total']:.4f}")
     m4.metric("All-time vision_title log (USD)", f"${cost_summary['log_total']:.4f}")
     st.caption("Per-product costs persist locally in outputs/title_gen_state.json and append to outputs/cost_log.csv.")
