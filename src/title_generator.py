@@ -81,6 +81,32 @@ def fetch_products_for_quotas(
     return selected, remaining
 
 
+def fetch_all_products(
+    client,
+    *,
+    query: str | None = "status:active",
+    page_size: int = 50,
+    max_pages: int = 200,
+) -> list[dict[str, Any]]:
+    """Fetch all Shopify products matching query (paginated)."""
+    selected: list[dict[str, Any]] = []
+    after: str | None = None
+    for _ in range(max_pages):
+        result = client.list_products(first=page_size, after=after, query=query)
+        for raw in result.get("products") or []:
+            prod = enrich_product_record(raw)
+            if not str(prod.get("primary_image_url") or "").strip():
+                continue
+            selected.append(prod)
+        page_info = result.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = str(page_info.get("endCursor") or "") or None
+        if not after:
+            break
+    return selected
+
+
 def generate_title_from_image(
     cfg,
     *,

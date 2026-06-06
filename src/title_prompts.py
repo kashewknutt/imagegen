@@ -20,6 +20,8 @@ Rules:
 - The title must feel specific to THIS piece, not generic catalogue filler.
 - Do NOT include SKU, price, brand prefix, or marketing fluff.
 - Do NOT invent gemstones, materials, or details that are not clearly visible.
+- Do NOT use a standalone letter "X" as a separator between words (bad: "Rose Gold X Tennis Bracelet"). Write natural phrases instead (good: "Rose Gold Tennis Bracelet").
+- Words that naturally contain the letter x are fine (e.g. "Classic", "Mixed").
 - Use natural title case. No quotes. No punctuation at the end.
 - Output format EXACTLY one line:
 TITLE: <your title>
@@ -132,17 +134,29 @@ def build_title_prompt(
     return "\n\n".join(parts)
 
 
+def sanitize_generated_title(title: str) -> str:
+    """Remove standalone ' X ' separators; keep words that contain x naturally."""
+    cleaned = re.sub(r"\s+[xX]\s+", " ", title or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def parse_generated_title(text: str) -> str:
     raw = (text or "").strip()
     if not raw:
         return ""
+    title = ""
     if "TITLE:" in raw.upper():
         for line in raw.splitlines():
             if line.strip().upper().startswith("TITLE:"):
-                return line.split(":", 1)[1].strip().strip('"').strip("'")
-    # Fallback: first non-empty line.
-    for line in raw.splitlines():
-        line = line.strip().strip('"').strip("'")
-        if line:
-            return line
-    return raw.strip().strip('"').strip("'")
+                title = line.split(":", 1)[1].strip().strip('"').strip("'")
+                break
+    if not title:
+        for line in raw.splitlines():
+            line = line.strip().strip('"').strip("'")
+            if line:
+                title = line
+                break
+    if not title:
+        title = raw.strip().strip('"').strip("'")
+    return sanitize_generated_title(title)

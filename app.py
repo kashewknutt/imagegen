@@ -39,7 +39,8 @@ from src.shopify_token_cache import load_cached_token, save_cached_token, Cached
 from src.shopify_settings import load_shopify_settings, save_shopify_settings, ShopifySettings
 from src.drive_client import ensure_client_secret_saved, get_drive_service, list_videos_for_sku, download_file_to_cache
 from src.title_prompts import TITLE_CATEGORIES
-from src.title_generator import fetch_products_for_quotas, generate_title_from_image
+from src.title_generator import fetch_all_products, fetch_products_for_quotas, generate_title_from_image
+from src.title_store import TitleStore
 
 log = logging.getLogger(__name__)
 
@@ -1008,9 +1009,100 @@ def _log_title_generation_cost(
         pass
 
 
+def _title_product_row(prod: dict, store: TitleStore) -> dict:
+    key = TitleStore.row_key(sku=str(prod.get("sku") or ""), product_id=str(prod.get("id") or ""))
+    saved = store.get(key)
+    generated = str(saved.get("generated_title") or "")
+    new_title = str(saved.get("new_title") or generated or "")
+    return {
+        "key": key,
+        "product_id": str(prod.get("id") or ""),
+        "sku": str(prod.get("sku") or ""),
+        "category": str(prod.get("canonical_category") or "other"),
+        "current_title": str(prod.get("title") or ""),
+        "generated_title": generated,
+        "new_title": new_title,
+        "cost_usd": str(saved.get("cost_usd") or ""),
+        "status": str(saved.get("status") or ""),
+        "image_url": str(prod.get("primary_image_url") or ""),
+        "product_type": str(prod.get("product_type") or ""),
+    }
+
+
+def _title_generate_for_row(cfg, *, row: dict, store: TitleStore, model: str) -> dict:
+    image_url = str(row.get("image_url") or "")
+    key = str(row.get("key") or "")
+    if not image_url:
+        store.update(
+            key,
+            sku=row.get("sku", ""),
+            product_id=row.get("product_id", ""),
+            status="error: missing image",
+            model=model,
+        )
+        row["status"] = "error: missing image"
+        return row
+
+    title, cost, err = generate_title_from_image(
+        cfg,
+        image_url=image_url,
+        category_key=str(row.get("category") or "other"),
+        cache_dir=cfg.download_cache_dir,
+        current_title=str(row.get("current_title") or ""),
+        product_type=str(row.get("product_type") or ""),
+        sku=str(row.get("sku") or ""),
+        model=model,
+    )
+    if err:
+        _log_title_generation_cost(cfg, key=key or str(row.get("sku") or ""), model=model, cost=0.0, status="error", error=err)
+        store.update(
+            key,
+            sku=row.get("sku", ""),
+            product_id=row.get("product_id", ""),
+            status=f"error: {err}",
+            model=model,
+        )
+        row["status"] = f"error: {err}"
+        return row
+
+    _log_title_generation_cost(cfg, key=key or str(row.get("sku") or ""), model=model, cost=cost)
+    saved = store.update(
+        key,
+        sku=row.get("sku", ""),
+        product_id=row.get("product_id", ""),
+        generated_title=title,
+        new_title=title,
+        cost_usd=f"{cost:.6f}",
+        status="generated",
+        model=model,
+    )
+    row["generated_title"] = title
+    row["new_title"] = title
+    row["cost_usd"] = saved.get("cost_usd", "")
+    row["status"] = "generated"
+    st.session_state[f"title_new::{key}"] = title
+    return row
+
+
+def _title_sync_inputs_to_store(store: TitleStore, catalog: list[dict]) -> None:
+    for row in catalog:
+        key = str(row.get("key") or "")
+        if not key:
+            continue
+        val = st.session_state.get(f"title_new::{key}")
+        if val is None:
+            continue
+        store.update(
+            key,
+            sku=row.get("sku", ""),
+            product_id=row.get("product_id", ""),
+            new_title=str(val),
+        )
+
+
 def _render_title_generator(cfg) -> None:
     st.subheader("Title Generator")
-    st.caption("Generate image-based product titles from live Shopify inventory, review them, then bulk-update Shopify.")
+    st.caption("Load all Shopify products, generate image-based titles, edit locally, then bulk-update Shopify.")
 
     _render_shopify_connection_sidebar(cfg)
     client = _shopify_client_from_session(cfg)
@@ -1018,28 +1110,8 @@ def _render_title_generator(cfg) -> None:
         st.warning("Connect Shopify in the sidebar (domain + token), then return here.")
         return
 
-    try:
-        import pandas as pd
-    except Exception:
-        st.error("Missing pandas dependency; reinstall requirements.")
-        return
-
+    store = TitleStore(cfg.outputs_dir / "title_gen_state.json")
     model = "models/gemini-2.5-flash"
-
-    with st.expander("Category quotas", expanded=True):
-        quota_cols = st.columns(4)
-        quotas: dict[str, int] = {}
-        for i, cat in enumerate(TITLE_CATEGORIES):
-            with quota_cols[i % 4]:
-                quotas[cat] = int(
-                    st.number_input(
-                        cat.title(),
-                        min_value=0,
-                        max_value=50,
-                        value=int(st.session_state.get(f"title_quota_{cat}", 0) or 0),
-                        key=f"title_quota_{cat}",
-                    )
-                )
 
     f1, f2 = st.columns([2, 1])
     with f1:
@@ -1055,208 +1127,165 @@ def _render_title_generator(cfg) -> None:
         query_parts.append(f"status:{status.lower()}")
     shopify_query = " ".join(query_parts) if query_parts else None
 
-    total_requested = sum(quotas.values())
-    action_cols = st.columns([1, 1, 2])
-    with action_cols[0]:
-        select_clicked = st.button("Select products", type="secondary", disabled=total_requested <= 0)
-    with action_cols[1]:
-        generate_clicked = st.button("Generate titles", type="primary", disabled=total_requested <= 0)
-    with action_cols[2]:
-        st.caption(f"Requested total: {total_requested}")
-
-    if select_clicked:
-        with st.spinner("Scanning Shopify catalog for category quotas..."):
-            selected, remaining = fetch_products_for_quotas(client, quotas, query=shopify_query)
-        rows = []
-        for prod in selected:
-            rows.append(
-                {
-                    "selected": True,
-                    "product_id": prod.get("id", ""),
-                    "sku": prod.get("sku", ""),
-                    "category": prod.get("canonical_category", ""),
-                    "current_title": prod.get("title", ""),
-                    "generated_title": "",
-                    "new_title": "",
-                    "cost_usd": "",
-                    "status": "selected",
-                    "image_url": prod.get("primary_image_url", ""),
-                    "product_type": prod.get("product_type", ""),
-                }
-            )
-        st.session_state.title_gen_rows = rows
-        st.session_state.title_gen_remaining = remaining
-        st.session_state.title_gen_version = int(st.session_state.get("title_gen_version", 0)) + 1
-        if not rows:
-            st.warning("No matching products with images were found for the requested quotas.")
-        else:
-            unfilled = {k: v for k, v in (remaining or {}).items() if int(v or 0) > 0}
-            if unfilled:
-                st.info(f"Selected {len(rows)} products. Unfilled quotas: {unfilled}")
-            else:
-                st.success(f"Selected {len(rows)} products.")
-
-    if generate_clicked:
-        rows = list(st.session_state.get("title_gen_rows") or [])
-        if not rows:
-            with st.spinner("Selecting products and generating titles..."):
-                selected, remaining = fetch_products_for_quotas(client, quotas, query=shopify_query)
-                st.session_state.title_gen_remaining = remaining
-                rows = [
-                    {
-                        "selected": True,
-                        "product_id": p.get("id", ""),
-                        "sku": p.get("sku", ""),
-                        "category": p.get("canonical_category", ""),
-                        "current_title": p.get("title", ""),
-                        "generated_title": "",
-                        "new_title": "",
-                        "cost_usd": "",
-                        "status": "selected",
-                        "image_url": p.get("primary_image_url", ""),
-                        "product_type": p.get("product_type", ""),
-                    }
-                    for p in selected
-                ]
-        if not rows:
-            st.warning("No products available to generate titles for.")
-        else:
-            progress = st.progress(0.0, text="Generating titles...")
-            for i, row in enumerate(rows):
-                progress.progress((i + 1) / max(1, len(rows)), text=f"Generating {i + 1}/{len(rows)}...")
-                image_url = str(row.get("image_url") or "")
-                if not image_url:
-                    row["status"] = "error: missing image"
-                    continue
-                title, cost, err = generate_title_from_image(
-                    cfg,
-                    image_url=image_url,
-                    category_key=str(row.get("category") or "other"),
-                    cache_dir=cfg.download_cache_dir,
-                    current_title=str(row.get("current_title") or ""),
-                    product_type=str(row.get("product_type") or ""),
-                    sku=str(row.get("sku") or ""),
-                    model=model,
+    with st.expander("Category quotas (optional sample)", expanded=False):
+        quota_cols = st.columns(4)
+        quotas: dict[str, int] = {}
+        for i, cat in enumerate(TITLE_CATEGORIES):
+            with quota_cols[i % 4]:
+                quotas[cat] = int(
+                    st.number_input(
+                        cat.title(),
+                        min_value=0,
+                        max_value=50,
+                        value=int(st.session_state.get(f"title_quota_{cat}", 0) or 0),
+                        key=f"title_quota_{cat}",
+                    )
                 )
-                if err:
-                    row["status"] = f"error: {err}"
-                    _log_title_generation_cost(cfg, key=str(row.get("sku") or row.get("product_id") or ""), model=model, cost=0.0, status="error", error=err)
-                else:
-                    row["generated_title"] = title
-                    row["new_title"] = title
-                    row["cost_usd"] = f"{cost:.6f}"
-                    row["status"] = "generated"
-                    _log_title_generation_cost(cfg, key=str(row.get("sku") or row.get("product_id") or ""), model=model, cost=cost)
-            st.session_state.title_gen_rows = rows
-            st.session_state.title_gen_version = int(st.session_state.get("title_gen_version", 0)) + 1
-            st.success(f"Generated titles for {sum(1 for r in rows if r.get('status') == 'generated')} product(s).")
 
-    rows = list(st.session_state.get("title_gen_rows") or [])
-    if not rows:
-        st.info("Set category quotas, then click Select products or Generate titles.")
+    top_cols = st.columns([1, 1, 1, 1, 2])
+    with top_cols[0]:
+        load_all_clicked = st.button("Load all products", type="primary")
+    with top_cols[1]:
+        load_quota_clicked = st.button("Load quota sample", disabled=sum(quotas.values()) <= 0)
+    with top_cols[2]:
+        generate_all_clicked = st.button("Generate all titles")
+    with top_cols[3]:
+        save_local_clicked = st.button("Save local edits")
+    with top_cols[4]:
+        bulk_update_clicked = st.button("Update all titles in Shopify", type="secondary")
+
+    if load_all_clicked:
+        with st.spinner("Loading all Shopify products with images..."):
+            products = fetch_all_products(client, query=shopify_query)
+            st.session_state.title_gen_catalog = [_title_product_row(p, store) for p in products]
+        st.success(f"Loaded {len(st.session_state.title_gen_catalog)} product(s).")
+
+    if load_quota_clicked:
+        with st.spinner("Loading quota sample from Shopify..."):
+            selected, remaining = fetch_products_for_quotas(client, quotas, query=shopify_query)
+            st.session_state.title_gen_catalog = [_title_product_row(p, store) for p in selected]
+            st.session_state.title_gen_remaining = remaining
+        st.success(f"Loaded {len(selected)} product(s).")
+
+    catalog: list[dict] = list(st.session_state.get("title_gen_catalog") or [])
+    if not catalog:
+        try:
+            with st.spinner("Loading Shopify products..."):
+                products = fetch_all_products(client, query=shopify_query)
+                catalog = [_title_product_row(p, store) for p in products]
+                st.session_state.title_gen_catalog = catalog
+        except Exception as e:
+            st.error("Failed to load Shopify products.")
+            st.exception(e)
+            return
+
+    if not catalog:
+        st.info("No products with images found in Shopify for the current filters.")
         return
+
+    if generate_all_clicked:
+        progress = st.progress(0.0, text="Generating titles for all products...")
+        for i, row in enumerate(catalog):
+            progress.progress((i + 1) / max(1, len(catalog)), text=f"Generating {i + 1}/{len(catalog)}...")
+            _title_generate_for_row(cfg, row=row, store=store, model=model)
+        st.session_state.title_gen_catalog = catalog
+        st.success(f"Generated titles for {sum(1 for r in catalog if r.get('status') == 'generated')} product(s).")
+        st.rerun()
+
+    if save_local_clicked:
+        _title_sync_inputs_to_store(store, catalog)
+        st.success("Saved local title edits.")
+        st.rerun()
+
+    if bulk_update_clicked:
+        _title_sync_inputs_to_store(store, catalog)
+        ok = 0
+        skipped = 0
+        failed: list[str] = []
+        for row in catalog:
+            key = str(row.get("key") or "")
+            saved = store.get(key)
+            product_id = str(row.get("product_id") or "").strip()
+            current_title = str(row.get("current_title") or "").strip()
+            new_title = str(saved.get("new_title") or st.session_state.get(f"title_new::{key}") or "").strip()
+            sku = str(row.get("sku") or key or product_id)
+            if not product_id or not new_title:
+                failed.append(f"{sku}: missing product_id or title")
+                continue
+            if new_title == current_title:
+                skipped += 1
+                store.update(key, status="unchanged")
+                row["status"] = "unchanged"
+                continue
+            try:
+                client.product_update_title(product_id=product_id, title=new_title)
+                ok += 1
+                row["current_title"] = new_title
+                row["status"] = "updated"
+                store.update(key, new_title=new_title, status="updated")
+            except Exception as e:
+                failed.append(f"{sku}: {e}")
+                store.update(key, status=f"update_error: {e}")
+                row["status"] = f"update_error: {e}"
+        st.session_state.title_gen_catalog = catalog
+        st.success(f"Updated {ok} title(s). Skipped {skipped} unchanged.")
+        if failed:
+            st.error("Some updates failed:")
+            for msg in failed:
+                st.write(f"- {msg}")
+        st.rerun()
 
     remaining = st.session_state.get("title_gen_remaining") or {}
     if remaining:
         unfilled = {k: v for k, v in remaining.items() if int(v or 0) > 0}
         if unfilled:
-            st.caption(f"Unfilled quotas from last selection: {unfilled}")
+            st.caption(f"Unfilled quotas from last sample load: {unfilled}")
 
-    df = pd.DataFrame(rows)
-    display_cols = [
-        "selected",
-        "sku",
-        "category",
-        "current_title",
-        "generated_title",
-        "new_title",
-        "cost_usd",
-        "status",
-        "product_id",
-        "image_url",
-        "product_type",
-    ]
-    for col in display_cols:
-        if col not in df.columns:
-            df[col] = ""
-    df = df[display_cols]
-
-    st.subheader("Review generated titles")
-    edited = st.data_editor(
-        df,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "selected": st.column_config.CheckboxColumn("Update?", default=True),
-            "sku": st.column_config.TextColumn("SKU", disabled=True),
-            "category": st.column_config.TextColumn("Category", disabled=True),
-            "current_title": st.column_config.TextColumn("Current title", disabled=True),
-            "generated_title": st.column_config.TextColumn("Generated title", disabled=True),
-            "new_title": st.column_config.TextColumn("Title to apply"),
-            "cost_usd": st.column_config.TextColumn("Cost (USD)", disabled=True),
-            "status": st.column_config.TextColumn("Status", disabled=True),
-            "product_id": None,
-            "image_url": None,
-            "product_type": None,
-        },
-        disabled=["sku", "category", "current_title", "generated_title", "cost_usd", "status"],
-        key=f"title_gen_editor_{int(st.session_state.get('title_gen_version', 0))}",
-    )
-
+    generated_count = sum(1 for r in catalog if str(r.get("generated_title") or "").strip())
     total_cost = 0.0
-    for val in edited.get("cost_usd", []):
+    for r in catalog:
         try:
-            total_cost += float(val or 0.0)
+            total_cost += float(r.get("cost_usd") or 0.0)
         except Exception:
             pass
-    st.caption(f"Total generation cost shown: ${total_cost:.4f}")
+    st.caption(f"Products: {len(catalog)} | With saved/generated titles: {generated_count} | Total cost: ${total_cost:.4f}")
 
-    preview_cols = st.columns(min(4, len(edited)))
-    for i, (_, row) in enumerate(edited.head(4).iterrows()):
-        with preview_cols[i % len(preview_cols)]:
-            url = str(row.get("image_url") or "")
-            if url:
-                st.image(url, width=140)
-            st.caption(str(row.get("sku") or ""))
+    per_page = st.selectbox("Rows per page", [10, 20, 50], index=1, key="title_gen_per_page")
+    max_page = max(1, (len(catalog) + per_page - 1) // per_page)
+    page = st.number_input("Page", min_value=1, max_value=max_page, value=1, key="title_gen_page")
+    start = (int(page) - 1) * int(per_page)
+    page_rows = catalog[start : start + int(per_page)]
 
-    if st.button("Update selected titles in Shopify", type="primary"):
-        to_update = edited[edited["selected"] == True]  # noqa: E712
-        if to_update.empty:
-            st.warning("No rows selected for update.")
-            return
+    st.subheader("Products")
+    for row in page_rows:
+        key = str(row.get("key") or "")
+        saved = store.get(key)
+        default_new = str(saved.get("new_title") or saved.get("generated_title") or row.get("new_title") or "")
 
-        ok = 0
-        failed: list[str] = []
-        success_ids: set[str] = set()
-        for _, row in to_update.iterrows():
-            product_id = str(row.get("product_id") or "").strip()
-            new_title = str(row.get("new_title") or "").strip()
-            sku = str(row.get("sku") or product_id)
-            if not product_id or not new_title:
-                failed.append(f"{sku}: missing product_id or title")
-                continue
-            try:
-                with st.spinner(f"Updating {sku}..."):
-                    client.product_update_title(product_id=product_id, title=new_title)
-                ok += 1
-                success_ids.add(product_id)
-            except Exception as e:
-                failed.append(f"{sku}: {e}")
-
-        updated_rows = edited.to_dict(orient="records")
-        for row in updated_rows:
-            pid = str(row.get("product_id") or "")
-            if pid in success_ids:
-                row["current_title"] = str(row.get("new_title") or "")
-                row["status"] = "updated"
-        st.session_state.title_gen_rows = updated_rows
-        st.session_state.title_gen_version = int(st.session_state.get("title_gen_version", 0)) + 1
-
-        st.success(f"Updated {ok} title(s) in Shopify.")
-        if failed:
-            st.error("Some updates failed:")
-            for msg in failed:
-                st.write(f"- {msg}")
+        with _bordered_container():
+            img_col, info_col = st.columns([1, 3])
+            with img_col:
+                url = str(row.get("image_url") or "")
+                if url:
+                    st.image(url, width=200)
+                else:
+                    st.warning("No image")
+            with info_col:
+                st.markdown(f"**{row.get('sku') or key}** · `{row.get('category') or ''}`")
+                st.caption(f"Current Shopify title: {row.get('current_title') or '—'}")
+                if row.get("generated_title"):
+                    st.caption(f"Last generated: {row.get('generated_title')} · Cost: ${float(row.get('cost_usd') or 0):.4f}")
+                st.text_input(
+                    "Title to apply",
+                    value=default_new,
+                    key=f"title_new::{key}",
+                )
+                if st.button("Generate title", key=f"title_gen_one::{key}", type="primary"):
+                    _title_generate_for_row(cfg, row=row, store=store, model=model)
+                    st.session_state.title_gen_catalog = catalog
+                    st.rerun()
+                if row.get("status"):
+                    st.caption(f"Status: {row.get('status')}")
 
 
 def _render_costs(cfg) -> None:
