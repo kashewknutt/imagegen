@@ -15,8 +15,7 @@ from dotenv import load_dotenv
 from build_stock_export import build_export
 from dedupe_titles_and_upload import _load_shopify_client, product_names_from_store
 from src.config import load_config
-from src.image_resolve import SUPPORTED_EXTS, find_local_image
-from src.name_group import base_key_from_path
+from src.shopify_media_sync import images_for_sku, sync_product_media
 from src.title_prompts import normalize_product_category
 from src.title_store import TitleStore
 from src.xlsx_ingest import index_by_sku, iter_rows
@@ -70,40 +69,6 @@ def _shopify_product_type(category: str, title: str = "") -> str:
     return _SHOPIFY_PRODUCT_TYPES.get(c, category.strip().title() or "Jewelry Sets")
 
 
-def _list_pics_raw(images_dir: Path, sku: str) -> list[Path]:
-    if not images_dir.exists():
-        return []
-    out: list[Path] = []
-    for p in sorted(images_dir.iterdir()):
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS and base_key_from_path(p) == sku:
-            out.append(p)
-    return out
-
-
-def _images_for_sku(cfg, sku: str) -> list[tuple[Path, str]]:
-    """Return (path, alt) pairs in upload order."""
-    out: list[tuple[Path, str]] = []
-    seen: set[str] = set()
-
-    def add(path: Path | None, alt: str) -> None:
-        if path is None or not path.is_file():
-            return
-        key = str(path.resolve())
-        if key in seen:
-            return
-        seen.add(key)
-        out.append((path, alt))
-
-    sku_dir = cfg.outputs_dir / sku
-    add(sku_dir / "prompt2_v1.jpg", f"{sku} - Product")
-    add(sku_dir / "prompt1_v1.jpg", f"{sku} - Lifestyle")
-    for p in _list_pics_raw(cfg.images_dir, sku):
-        add(p, f"{sku} - Reference")
-    if not out:
-        add(find_local_image(cfg.images_dir, sku, ""), f"{sku} - Reference")
-    return out
-
-
 def _stock_row(stock_path: Path, sku: str) -> dict:
     rows = index_by_sku(iter_rows(stock_path, ["Total"]), sku_column="SKU")
     row = rows.get(sku)
@@ -134,26 +99,6 @@ def _pending_skus(store: TitleStore) -> list[str]:
     return out
 
 
-def _upload_images(client, *, product_id: str, sku: str, images: list[tuple[Path, str]]) -> int:
-    media_urls: list[str] = []
-    for img_path, alt in images:
-        mime = "image/jpeg" if img_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
-        cdn = client.upload_image_bytes(
-            file_bytes=img_path.read_bytes(),
-            filename=img_path.name,
-            mime_type=mime,
-            alt=alt,
-        )
-        media_urls.append(cdn)
-        log.info("[%s] Staged image: %s", sku, img_path.name)
-    if media_urls:
-        client.product_create_media(
-            product_id=product_id,
-            media=[{"mediaContentType": "IMAGE", "originalSource": u, "alt": sku} for u in media_urls],
-        )
-    return len(media_urls)
-
-
 def create_missing_products(
     *,
     cfg,
@@ -180,7 +125,7 @@ def create_missing_products(
             log.info("[%d/%d] %s — already on Shopify", i, len(targets), sku)
             continue
 
-        images = _images_for_sku(cfg, sku)
+        images = images_for_sku(cfg, sku)
         if not images:
             log.error("[%d/%d] %s — skip (no image)", i, len(targets), sku)
             store.update(sku, status="error: no image for Shopify upload")
@@ -228,7 +173,7 @@ def create_missing_products(
                                 available=int(qty),
                             )
 
-            n_images = _upload_images(client, product_id=product_id, sku=sku, images=images)
+            n_images = sync_product_media(client, product_id=product_id, sku=sku, images=images, replace_existing=False)
             store.update(
                 sku,
                 product_id=product_id,

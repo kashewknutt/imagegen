@@ -430,6 +430,38 @@ class ShopifyClient:
             time.sleep(sleep_seconds)
         return last
 
+    def product_set_featured_media(self, *, product_id: str, media_id: str) -> None:
+        """Set the product thumbnail/featured image to an existing media item."""
+        mutation = """
+        mutation ProductSetFeaturedMedia($input: ProductInput!) {
+          productUpdate(input: $input) {
+            product { id featuredImage { url } }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"input": {"id": product_id, "featuredMediaId": media_id}})
+        payload = data.get("productUpdate") or {}
+        errs = payload.get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"productUpdate featuredMediaId userErrors: {errs}")
+
+    def product_reorder_media(self, *, product_id: str, moves: list[dict[str, str]]) -> None:
+        """Reorder product media. Each move: {id: media_id, newPosition: \"0\"}."""
+        mutation = """
+        mutation ProductReorderMedia($id: ID!, $moves: [MoveInput!]!) {
+          productReorderMedia(id: $id, moves: $moves) {
+            job { id }
+            mediaUserErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"id": product_id, "moves": moves})
+        payload = data.get("productReorderMedia") or {}
+        errs = payload.get("mediaUserErrors") or []
+        if errs:
+            raise RuntimeError(f"productReorderMedia userErrors: {errs}")
+
     def product_create_media(self, *, product_id: str, media: list[dict[str, str]]) -> list[dict[str, str]]:
         query = """
         mutation ProductCreateMedia($id: ID!, $media: [CreateMediaInput!]!) {
