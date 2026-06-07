@@ -68,6 +68,7 @@ def build_export(
     outputs_dir: Path,
     output_path: Path,
     stock_sheets: list[str] | None = None,
+    product_names: dict[str, str] | None = None,
 ) -> int:
     sheets = stock_sheets or ["Total"]
     stock_rows = iter_rows(stock_path, sheets)
@@ -75,6 +76,7 @@ def build_export(
         raise RuntimeError(f"No rows found in {stock_path} sheets={sheets}")
 
     title_by_sku = _load_product_titles(products_path)
+    overrides = product_names or {}
 
     stock_columns = list(stock_rows[0].values.keys())
     extra_columns = [
@@ -98,7 +100,7 @@ def build_export(
 
         base = [vals.get(col, "") for col in stock_columns]
         extras = [
-            title_by_sku.get(sku, ""),
+            overrides.get(sku) or title_by_sku.get(sku, ""),
             _thumbnail_image_path(outputs_dir=outputs_dir, sku=sku),
             _thumbnail_image_name(category=category, sku=sku),
             "",

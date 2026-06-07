@@ -110,13 +110,15 @@ def fetch_all_products(
 def generate_title_from_image(
     cfg,
     *,
-    image_url: str,
+    image_url: str = "",
+    image_path: Path | None = None,
     category_key: str,
     cache_dir: Path,
     current_title: str = "",
     product_type: str = "",
     sku: str = "",
     model: str = "models/gemini-2.5-flash",
+    avoid_titles: list[str] | None = None,
 ) -> tuple[str, float, str, dict]:
     """
     Vision-based title generation from a product image URL.
@@ -128,9 +130,13 @@ def generate_title_from_image(
     if not api_key:
         return "", 0.0, "Missing GOOGLE_API_KEY / GEMINI_API_KEY", empty_meta
 
-    local_path = download_first_image_url([image_url], cache_dir)
+    local_path: Path | None = None
+    if image_path and Path(image_path).is_file():
+        local_path = Path(image_path)
+    elif image_url:
+        local_path = download_first_image_url([image_url], cache_dir)
     if not local_path:
-        return "", 0.0, f"Could not download image: {image_url}", empty_meta
+        return "", 0.0, "No image available for title generation", empty_meta
 
     try:
         from google import genai
@@ -141,6 +147,7 @@ def generate_title_from_image(
             current_title=current_title,
             product_type=product_type,
             sku=sku,
+            avoid_titles=avoid_titles,
         )
         image = open_pil(local_path)
         client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version="v1beta"))

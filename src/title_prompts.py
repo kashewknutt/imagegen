@@ -117,6 +117,7 @@ def build_title_prompt(
     current_title: str = "",
     product_type: str = "",
     sku: str = "",
+    avoid_titles: list[str] | None = None,
 ) -> str:
     key = category_key if category_key in _CATEGORY_PROMPTS else "other"
     system = _CATEGORY_PROMPTS[key]
@@ -127,6 +128,13 @@ def build_title_prompt(
         context_lines.append(f"Product type: {product_type.strip()}")
     if sku.strip():
         context_lines.append(f"SKU (do not include in title): {sku.strip()}")
+    avoid = [str(t).strip() for t in (avoid_titles or []) if str(t).strip()]
+    if avoid:
+        shown = "\n".join(f"- {t}" for t in avoid[:40])
+        context_lines.append(
+            "These titles are already used and must NOT be repeated. Create a clearly different name:\n"
+            f"{shown}"
+        )
     context = "\n".join(context_lines)
     parts = [system, _SHARED_RULES]
     if context:
