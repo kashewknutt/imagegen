@@ -45,7 +45,8 @@ def find_local_image_by_sku(images_dir: Path, sku: str) -> Path | None:
     sku_upper = s.upper()
     candidates: list[Path] = []
     for p in _iter_image_files(images_dir):
-        if sku_upper in p.name.upper():
+        stem = p.stem.upper()
+        if stem == sku_upper or stem.startswith(f"{sku_upper}_") or stem.startswith(f"{sku_upper} "):
             candidates.append(p)
 
     if not candidates:

@@ -168,11 +168,13 @@ def generate_pair(
 
     if cfg.quality_guard_enabled:
         # Compare against the first (primary) reference image.
+        # Only prompt2 (product shot) is checked — prompt1 is a lifestyle try-on and
+        # is expected to differ strongly from the flat product reference.
         ref0 = work.reference_rgbs[0]
         q1 = check_similarity(ref0, img1, cfg.quality_luma_corr_threshold, cfg.quality_edge_corr_threshold)
         q2 = check_similarity(ref0, img2, cfg.quality_luma_corr_threshold, cfg.quality_edge_corr_threshold)
         meta["quality"] = {"prompt1": q1.__dict__, "prompt2": q2.__dict__}
-        if not q1.ok or not q2.ok:
+        if not q2.ok:
             meta["auto_rejected"] = True
             # Still save for inspection; caller decides whether to re-roll.
 
