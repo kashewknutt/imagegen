@@ -1133,7 +1133,7 @@ def _render_shopify_review(cfg) -> None:
         product_type_filter = st.text_input("Product type", value=st.session_state.get("shopify_review_product_type", ""))
         st.session_state.shopify_review_product_type = product_type_filter
     with f5:
-        page_size = st.selectbox("Per page", [5, 10, 15, 20], index=1, key="shopify_review_page_size")
+        page_size = st.selectbox("Per page", [10, 20, 50], index=2, key="shopify_review_page_size")
 
     filter_key = f"{search}|{status}|{review_filter}|{product_type_filter}|{page_size}"
     if st.session_state.get("shopify_review_filter_key") != filter_key:
