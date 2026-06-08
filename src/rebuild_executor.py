@@ -448,6 +448,157 @@ def _stock_row(stock_path: Path, sku: str) -> dict:
     return dict(getattr(row, "values", {}) or {}) if row else {}
 
 
+def _is_transient_network_error(error: str) -> bool:
+    err = (error or "").lower()
+    markers = (
+        "nameresolutionerror",
+        "connecttimeouterror",
+        "connection reset",
+        "connection aborted",
+        "max retries exceeded",
+        "timed out",
+        "no route to host",
+        "failed to resolve",
+    )
+    return any(m in err for m in markers)
+
+
+def list_remaining_upload_skus(
+    cfg,
+    review_store: ReviewStore,
+    *,
+    stock_path: Path | None = None,
+) -> list[dict[str, str]]:
+    """Eligible approved SKUs not yet marked uploaded (the main backlog)."""
+    eligibility = build_eligibility(cfg, review_store, stock_path or cfg.xlsx_path)
+    out: list[dict[str, str]] = []
+    for sku in eligibility.eligible:
+        rec = review_store.get_record(sku)
+        if str(rec.get("review_status") or "") == "uploaded":
+            continue
+        out.append(
+            {
+                "sku": sku,
+                "title": str(rec.get("title") or ""),
+                "review_status": str(rec.get("review_status") or ""),
+                "product_id": str(rec.get("product_id") or ""),
+            }
+        )
+    return out
+
+
+def upload_remaining_approved_products(
+    cfg,
+    client,
+    *,
+    skus: list[str] | None = None,
+    dry_run: bool = False,
+    sleep_seconds: float = 1.0,
+    limit: int = 0,
+    stop_after_network_errors: int = 3,
+) -> dict[str, Any]:
+    """Upload eligible SKUs that are approved/failed but not yet uploaded."""
+    review_store = ReviewStore(cfg.outputs_dir / "review_state.json")
+    title_store = TitleStore(cfg.outputs_dir / "title_gen_state.json")
+
+    if skus:
+        targets = [s.strip() for s in skus if s.strip()]
+    else:
+        targets = [item["sku"] for item in list_remaining_upload_skus(cfg, review_store)]
+
+    if limit > 0:
+        targets = targets[:limit]
+
+    if not targets:
+        log.info("No remaining SKUs to upload")
+        return {"dry_run": dry_run, "targets": [], "success_count": 0, "failed_count": 0}
+
+    log.info("Uploading %d remaining SKU(s) (approved backlog, not yet on Shopify)", len(targets))
+    report = recreate_approved_products(
+        cfg,
+        client,
+        review_store,
+        title_store,
+        cfg.xlsx_path,
+        targets,
+        dry_run=dry_run,
+        sleep_seconds=sleep_seconds,
+        stop_after_network_errors=stop_after_network_errors,
+    )
+    report["phase"] = "upload_remaining_approved"
+    save_phase_report(cfg.outputs_dir, "upload_remaining_approved", report)
+    return report
+
+
+def list_failed_skus(review_store: ReviewStore) -> list[dict[str, str]]:
+    """Return failed SKU records sorted by SKU."""
+    out: list[dict[str, str]] = []
+    for sku, rec in sorted(review_store.all_records().items()):
+        if str(rec.get("review_status") or "") != "failed":
+            continue
+        out.append(
+            {
+                "sku": sku,
+                "title": str(rec.get("title") or ""),
+                "product_id": str(rec.get("product_id") or ""),
+                "last_error": str(rec.get("last_error") or "")[:300],
+            }
+        )
+    return out
+
+
+def retry_failed_products(
+    cfg,
+    client,
+    *,
+    skus: list[str] | None = None,
+    dry_run: bool = False,
+    sleep_seconds: float = 1.0,
+    limit: int = 0,
+) -> dict[str, Any]:
+    """Retry Shopify create/upload for SKUs marked failed in review_state."""
+    review_store = ReviewStore(cfg.outputs_dir / "review_state.json")
+    title_store = TitleStore(cfg.outputs_dir / "title_gen_state.json")
+
+    if skus:
+        targets = [s.strip() for s in skus if s.strip()]
+    else:
+        targets = [item["sku"] for item in list_failed_skus(review_store)]
+
+    if limit > 0:
+        targets = targets[:limit]
+
+    if not targets:
+        log.info("No failed SKUs to retry")
+        return {"dry_run": dry_run, "targets": [], "success_count": 0, "failed_count": 0}
+
+    log.info("Retrying %d failed SKU(s)", len(targets))
+    for sku in targets:
+        rec = review_store.get_record(sku)
+        if str(rec.get("review_status") or "") == "failed":
+            review_store.update(
+                sku,
+                review_status="approved",
+                upload_status="pending",
+                last_error="",
+            )
+
+    report = recreate_approved_products(
+        cfg,
+        client,
+        review_store,
+        title_store,
+        cfg.xlsx_path,
+        targets,
+        dry_run=dry_run,
+        sleep_seconds=sleep_seconds,
+        stop_after_network_errors=3,
+    )
+    report["phase"] = "retry_failed_products"
+    save_phase_report(cfg.outputs_dir, "retry_failed_products", report)
+    return report
+
+
 def recover_orphan_product_ids(
     client,
     review_store: ReviewStore,
@@ -490,12 +641,15 @@ def recreate_approved_products(
     *,
     dry_run: bool = False,
     sleep_seconds: float = 0.5,
+    stop_after_network_errors: int = 0,
 ) -> dict[str, Any]:
     from upload_missing_shopify_products import _price_fields, _shopify_product_type
 
     ok: list[str] = []
     failed: dict[str, str] = {}
     created: list[dict[str, str]] = []
+    stopped_early = False
+    consecutive_network_errors = 0
 
     if not dry_run:
         recovered = recover_orphan_product_ids(client, review_store, eligible_skus)
@@ -611,6 +765,22 @@ def recreate_approved_products(
             failed[sku] = err
             review_store.mark_failed(sku, err)
             log.error("[%s] Create failed: %s", sku, e)
+            if _is_transient_network_error(err):
+                consecutive_network_errors += 1
+                if (
+                    stop_after_network_errors > 0
+                    and consecutive_network_errors >= stop_after_network_errors
+                ):
+                    log.error(
+                        "Stopping after %d consecutive network error(s) — fix connection and re-run",
+                        consecutive_network_errors,
+                    )
+                    stopped_early = True
+                    break
+            else:
+                consecutive_network_errors = 0
+        else:
+            consecutive_network_errors = 0
         time.sleep(sleep_seconds)
 
     report = {
@@ -618,6 +788,7 @@ def recreate_approved_products(
         "eligible_count": len(eligible_skus),
         "success_count": len(ok),
         "failed_count": len(failed),
+        "stopped_early": stopped_early,
         "success": ok,
         "failed": failed,
         "created": created,
