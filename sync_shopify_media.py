@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from dedupe_titles_and_upload import _load_shopify_client
 from src.config import load_config
 from src.shopify_media_sync import images_for_sku, sync_product_media
+from src.shopify_product_dedup import is_active_shopify_product, prefer_canonical_product, primary_sku_from_product
 from src.title_store import TitleStore
 
 log = logging.getLogger("sync_shopify_media")
@@ -65,8 +66,15 @@ def main() -> int:
     for _ in range(200):
         page = client.list_products(first=50, after=after, query=None)
         for p in page.get("products") or []:
-            for sku in p.get("skus") or []:
-                by_sku[str(sku).strip()] = p
+            if not is_active_shopify_product(p):
+                continue
+            sku = primary_sku_from_product(p)
+            if not sku:
+                continue
+            if sku not in by_sku:
+                by_sku[sku] = p
+            else:
+                by_sku[sku] = prefer_canonical_product(by_sku[sku], p, sku=sku)
         pi = page.get("pageInfo") or {}
         if not pi.get("hasNextPage"):
             break

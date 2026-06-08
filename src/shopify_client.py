@@ -284,6 +284,22 @@ class ShopifyClient:
             "product_type": str(prod.get("productType") or product_type or ""),
         }
 
+    def product_update_status(self, *, product_id: str, status: str) -> None:
+        """Set product status, e.g. ACTIVE, DRAFT, ARCHIVED."""
+        mutation = """
+        mutation ProductUpdateStatus($input: ProductInput!) {
+          productUpdate(input: $input) {
+            product { id status }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"input": {"id": product_id, "status": status}})
+        payload = data.get("productUpdate") or {}
+        errs = payload.get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"productUpdate status userErrors: {errs}")
+
     def product_update_metafields(self, *, product_id: str, metafields: list[dict[str, str]]) -> None:
         """
         Sets metafields on a product using productUpdate. Each metafield item must include:

@@ -860,7 +860,13 @@ def _primary_sku_from_product(prod: dict) -> str:
     return str(skus[0] if skus else prod.get("sku") or "").strip()
 
 
+def _is_active_shopify_product(prod: dict) -> bool:
+    return str(prod.get("status") or "ACTIVE").upper() not in {"ARCHIVED", "DRAFT"}
+
+
 def _product_matches_review_filter(review_store: ReviewStore, prod: dict, review_filter: str) -> bool:
+    if not _is_active_shopify_product(prod):
+        return False
     sku = _primary_sku_from_product(prod)
     if not sku:
         return False
@@ -878,10 +884,11 @@ def _fetch_review_filtered_products(
     batch_size: int = 50,
     max_batches: int = 250,
 ) -> tuple[list[dict], bool]:
-    """Scan Shopify and return the next page_size products matching review_filter."""
+    """Scan Shopify and return the next page_size unique-SKU products matching review_filter."""
     skip_target = page_idx * page_size
     collected: list[dict] = []
-    skipped = 0
+    skipped_unique = 0
+    seen_skus: set[str] = set()
     after: str | None = None
     seek_has_next = False
 
@@ -890,8 +897,12 @@ def _fetch_review_filtered_products(
         for prod in result.get("products") or []:
             if not _product_matches_review_filter(review_store, prod, review_filter):
                 continue
-            if skipped < skip_target:
-                skipped += 1
+            sku = _primary_sku_from_product(prod)
+            if not sku or sku in seen_skus:
+                continue
+            seen_skus.add(sku)
+            if skipped_unique < skip_target:
+                skipped_unique += 1
                 continue
             if not seek_has_next:
                 collected.append(prod)
@@ -932,16 +943,90 @@ def _fetch_shopify_review_page(
         )
         return products, has_next, cursors
 
-    after = cursors[page_idx] if page_idx < len(cursors) else None
-    result = client.list_products(first=int(page_size), after=after, query=shopify_query)
-    products = list(result.get("products") or [])
-    page_info = result.get("pageInfo") or {}
-    has_next = bool(page_info.get("hasNextPage"))
-    if has_next:
-        end_cursor = str(page_info.get("endCursor") or "")
-        if end_cursor and page_idx + 1 >= len(cursors):
-            cursors = [*cursors, end_cursor]
+    # ALL mode: scan unique SKUs like filtered mode (Shopify returns duplicate products per SKU).
+    products, has_next = _fetch_review_filtered_products(
+        client,
+        review_store,
+        review_filter="ALL",
+        page_size=page_size,
+        page_idx=page_idx,
+        shopify_query=shopify_query,
+    )
     return products, has_next, cursors
+
+
+def _bulk_approve_page_products(
+    cfg,
+    review_store: ReviewStore,
+    title_store: TitleStore,
+    page_products: list[dict],
+) -> list[str]:
+    approved_skus: list[str] = []
+    for prod in page_products:
+        product_id = str(prod.get("id") or "")
+        handle = str(prod.get("handle") or "")
+        primary_sku = _primary_sku_from_product(prod)
+        if not primary_sku:
+            continue
+        defaults = _review_field_defaults(
+            review_store=review_store,
+            title_store=title_store,
+            prod=prod,
+            primary_sku=primary_sku,
+        )
+        form_key = _review_form_key(product_id, primary_sku)
+        _approve_review_sku(
+            cfg,
+            review_store,
+            primary_sku=primary_sku,
+            product_id=product_id,
+            handle=handle,
+            title=str(st.session_state.get(f"title::{form_key}", defaults["title"])),
+            category=str(st.session_state.get(f"cat::{form_key}", defaults["category"])),
+            description=str(st.session_state.get(f"desc::{form_key}", defaults["description"])),
+            tags=str(st.session_state.get(f"tags::{form_key}", defaults["tags"])),
+            prompt1_text=str(st.session_state.get(f"prompt1::{form_key}", defaults["prompt1_text"])),
+            prompt2_text=str(st.session_state.get(f"prompt2::{form_key}", defaults["prompt2_text"])),
+        )
+        approved_skus.append(primary_sku)
+    return approved_skus
+
+
+def _render_bulk_approve_bar(
+    *,
+    cfg,
+    review_store: ReviewStore,
+    title_store: TitleStore,
+    page_products: list[dict],
+    page_idx: int,
+    review_filter: str,
+    button_key: str,
+) -> None:
+    bulk_col1, bulk_col2 = st.columns([1, 3])
+    with bulk_col1:
+        if st.button(
+            f"Bulk approve page ({len(page_products)})",
+            key=button_key,
+            type="primary",
+        ):
+            with st.spinner(f"Approving {len(page_products)} product(s) on this page..."):
+                approved_skus = _bulk_approve_page_products(
+                    cfg,
+                    review_store,
+                    title_store,
+                    page_products,
+                )
+            try:
+                _rebuild_stock_export(cfg)
+            except Exception as e:
+                st.warning(f"XLSX rebuild failed: {e}")
+            st.success(f"Bulk approved {len(approved_skus)} SKU(s): {', '.join(approved_skus)}")
+            st.rerun()
+    with bulk_col2:
+        st.caption(
+            "Approves every product on this page (one per SKU) using latest workspace images "
+            "and current field values, then rebuilds stock_enriched.xlsx."
+        )
 
 
 def _approve_review_sku(
@@ -1106,6 +1191,17 @@ def _render_shopify_review(cfg) -> None:
         else:
             st.info(f"No `{review_filter}` products found. Try Previous/Next or change filters.")
         return
+
+    _render_bulk_approve_bar(
+        cfg=cfg,
+        review_store=review_store,
+        title_store=title_store,
+        page_products=page_products,
+        page_idx=page_idx,
+        review_filter=review_filter,
+        button_key=f"bulk_approve_top::{page_idx}::{review_filter}",
+    )
+    st.divider()
 
     gen_client = _ensure_genai_client(cfg)
 
@@ -1328,54 +1424,15 @@ def _render_shopify_review(cfg) -> None:
                     st.caption(f"Last error: {rec.get('last_error')}")
 
     st.divider()
-    bulk_col1, bulk_col2 = st.columns([1, 3])
-    with bulk_col1:
-        if st.button(
-            f"Bulk approve page ({len(page_products)})",
-            key=f"bulk_approve_page::{page_idx}::{review_filter}",
-            type="primary",
-        ):
-            approved_skus: list[str] = []
-            with st.spinner(f"Approving {len(page_products)} product(s) on this page..."):
-                for prod in page_products:
-                    product_id = str(prod.get("id") or "")
-                    handle = str(prod.get("handle") or "")
-                    skus = prod.get("skus") or []
-                    primary_sku = str(skus[0] if skus else prod.get("sku") or "").strip()
-                    if not primary_sku:
-                        continue
-                    defaults = _review_field_defaults(
-                        review_store=review_store,
-                        title_store=title_store,
-                        prod=prod,
-                        primary_sku=primary_sku,
-                    )
-                    form_key = _review_form_key(product_id, primary_sku)
-                    _approve_review_sku(
-                        cfg,
-                        review_store,
-                        primary_sku=primary_sku,
-                        product_id=product_id,
-                        handle=handle,
-                        title=str(st.session_state.get(f"title::{form_key}", defaults["title"])),
-                        category=str(st.session_state.get(f"cat::{form_key}", defaults["category"])),
-                        description=str(st.session_state.get(f"desc::{form_key}", defaults["description"])),
-                        tags=str(st.session_state.get(f"tags::{form_key}", defaults["tags"])),
-                        prompt1_text=str(st.session_state.get(f"prompt1::{form_key}", defaults["prompt1_text"])),
-                        prompt2_text=str(st.session_state.get(f"prompt2::{form_key}", defaults["prompt2_text"])),
-                    )
-                    approved_skus.append(primary_sku)
-            try:
-                _rebuild_stock_export(cfg)
-            except Exception as e:
-                st.warning(f"XLSX rebuild failed: {e}")
-            st.success(f"Bulk approved {len(approved_skus)} SKU(s): {', '.join(approved_skus)}")
-            st.rerun()
-    with bulk_col2:
-        st.caption(
-            "Approves every product shown on this page using the latest workspace images "
-            "(including regenerated prompt1/prompt2) and current field values, then rebuilds stock_enriched.xlsx."
-        )
+    _render_bulk_approve_bar(
+        cfg=cfg,
+        review_store=review_store,
+        title_store=title_store,
+        page_products=page_products,
+        page_idx=page_idx,
+        review_filter=review_filter,
+        button_key=f"bulk_approve_bottom::{page_idx}::{review_filter}",
+    )
 
 
 def _log_title_generation_cost(
