@@ -16,6 +16,7 @@ from build_stock_export import build_export
 from dedupe_titles_and_upload import _load_shopify_client, product_names_from_store
 from src.config import load_config
 from src.shopify_media_sync import images_for_sku, sync_product_media
+from src.stock_pricing import price_fields_from_row
 from src.title_prompts import normalize_product_category
 from src.title_store import TitleStore
 from src.xlsx_ingest import index_by_sku, iter_rows
@@ -76,16 +77,7 @@ def _stock_row(stock_path: Path, sku: str) -> dict:
 
 
 def _price_fields(row: dict) -> tuple[str, str, float | None, int]:
-    price_sell = str(row.get("price_2") or row.get("price") or "").strip()
-    labour = _parse_float(row.get("Labour"))
-    rate = _parse_float(row.get("rate"))
-    weight_g = _parse_float(row.get("weight"))
-    qty = int(_parse_float(row.get("quantity")) or 0)
-    cost = None
-    if labour is not None and rate is not None:
-        cost = labour + (rate * weight_g if weight_g is not None else rate)
-    price_cost = f"{cost:.2f}" if cost is not None else ""
-    return price_sell, price_cost, weight_g, qty
+    return price_fields_from_row(row)
 
 
 def _pending_skus(store: TitleStore) -> list[str]:

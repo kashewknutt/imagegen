@@ -442,10 +442,32 @@ def _parse_float(value: object) -> float | None:
         return None
 
 
-def _stock_row(stock_path: Path, sku: str) -> dict:
+def _enriched_row_index(enriched_path: Path) -> dict[str, dict]:
+    from openpyxl import load_workbook
+
+    if not enriched_path.is_file():
+        return {}
+    wb = load_workbook(enriched_path, read_only=True, data_only=True)
+    ws = wb.active
+    headers = [str(c.value or "").strip() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    out: dict[str, dict] = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        vals = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+        sku = str(vals.get("SKU") or "").strip()
+        if sku and sku not in out:
+            out[sku] = vals
+    wb.close()
+    return out
+
+
+def _stock_row(stock_path: Path, sku: str, *, enriched_path: Path | None = None) -> dict:
     rows = index_by_sku(iter_rows(stock_path, ["Total"]), sku_column="SKU")
     row = rows.get(sku)
-    return dict(getattr(row, "values", {}) or {}) if row else {}
+    if row:
+        return dict(getattr(row, "values", {}) or {})
+    if enriched_path is not None:
+        return dict(_enriched_row_index(enriched_path).get(sku) or {})
+    return {}
 
 
 def _is_transient_network_error(error: str) -> bool:
@@ -674,7 +696,7 @@ def recreate_approved_products(
             review_store.mark_failed(sku, "no local images")
             continue
 
-        row = _stock_row(stock_path, sku)
+        row = _stock_row(stock_path, sku, enriched_path=cfg.outputs_dir / "stock_enriched.xlsx")
         category = str(rec.get("category") or row.get("category") or "").strip()
         product_type = str(rec.get("product_type") or "").strip() or _shopify_product_type(category, title=title)
         description = str(rec.get("description") or "").strip() or f"{title}."

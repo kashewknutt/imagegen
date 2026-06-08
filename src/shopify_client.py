@@ -603,6 +603,76 @@ class ShopifyClient:
         }
         return self.collection_create(title=title, handle=handle, rule_set=rule_set)
 
+    def fetch_all_variants(
+        self,
+        *,
+        batch_size: int = 50,
+        max_pages: int = 250,
+    ) -> list[dict[str, Any]]:
+        """List every product variant with SKU, price, and inventory item id."""
+        gql = """
+        query FetchVariants($first: Int!, $after: String) {
+          products(first: $first, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                id
+                handle
+                variants(first: 10) {
+                  edges {
+                    node {
+                      id
+                      sku
+                      price
+                      inventoryItem { id }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        out: list[dict[str, Any]] = []
+        after = None
+        for _ in range(max_pages):
+            data = self.graphql(gql, {"first": int(batch_size), "after": after})
+            payload = data.get("products") or {}
+            for edge in payload.get("edges") or []:
+                node = edge.get("node") or {}
+                product_id = str(node.get("id") or "")
+                handle = str(node.get("handle") or "")
+                for ve in ((node.get("variants") or {}).get("edges") or []):
+                    vn = ve.get("node") or {}
+                    sku = str(vn.get("sku") or "").strip()
+                    if not sku:
+                        continue
+                    inv = vn.get("inventoryItem") or {}
+                    out.append(
+                        {
+                            "sku": sku,
+                            "variant_id": str(vn.get("id") or ""),
+                            "variant_id_int": self._gid_to_int(str(vn.get("id") or "")),
+                            "product_id": product_id,
+                            "handle": handle,
+                            "current_price": str(vn.get("price") or ""),
+                            "inventory_item_id": self._gid_to_int(str(inv.get("id") or "")),
+                        }
+                    )
+            page_info = payload.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+        return out
+
+    @staticmethod
+    def _gid_to_int(gid: str) -> int | None:
+        try:
+            s = str(gid or "").strip()
+            return int(s.rsplit("/", 1)[-1]) if s else None
+        except Exception:
+            return None
+
     def list_products(
         self,
         *,
