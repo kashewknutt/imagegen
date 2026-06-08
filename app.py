@@ -799,6 +799,192 @@ def _review_status_badge(status: str) -> str:
     return f"{colors.get(status, '⚪')} `{status}`"
 
 
+def _local_review_status(review_store: ReviewStore, sku: str) -> str:
+    return str(review_store.get_record(sku).get("review_status") or "pending_review")
+
+
+def _matches_review_filter(status: str, review_filter: str) -> bool:
+    if review_filter == "ALL":
+        return True
+    if review_filter == "Pending review":
+        return status in {"pending_review", "failed"}
+    if review_filter == "Approved":
+        return status == "approved"
+    if review_filter == "Uploaded":
+        return status == "uploaded"
+    if review_filter == "Failed":
+        return status == "failed"
+    return True
+
+
+def _review_form_key(product_id: str, primary_sku: str) -> str:
+    return f"review_form::{product_id}::{primary_sku}"
+
+
+def _review_field_defaults(
+    *,
+    review_store: ReviewStore,
+    title_store: TitleStore,
+    prod: dict,
+    primary_sku: str,
+) -> dict[str, str]:
+    rec = review_store.get_record(primary_sku)
+    title_rec = title_store.get(primary_sku)
+    shop_title = str(prod.get("title") or "")
+    category = str(prod.get("category") or prod.get("product_type") or "")
+    product_type = str(prod.get("product_type") or category)
+    description_html = str(prod.get("description_html") or "")
+    return {
+        "title": (
+            str(rec.get("title") or "").strip()
+            or str(title_rec.get("new_title") or title_rec.get("generated_title") or "").strip()
+            or shop_title
+        ),
+        "category": product_type or category,
+        "description": str(rec.get("description") or _strip_html(description_html, max_len=8000)),
+        "tags": str(rec.get("tags") or ""),
+        "prompt1_text": str(rec.get("prompt1_text") or PROMPT_1),
+        "prompt2_text": str(rec.get("prompt2_text") or PROMPT_2),
+    }
+
+
+def _latest_prompt_versions(cfg, primary_sku: str) -> tuple[int | None, int | None]:
+    media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=primary_sku)
+    p1_ver = media_idx.prompt1_versions[-1][0] if media_idx.prompt1_versions else None
+    p2_ver = media_idx.prompt2_versions[-1][0] if media_idx.prompt2_versions else None
+    return p1_ver, p2_ver
+
+
+def _primary_sku_from_product(prod: dict) -> str:
+    skus = prod.get("skus") or []
+    return str(skus[0] if skus else prod.get("sku") or "").strip()
+
+
+def _product_matches_review_filter(review_store: ReviewStore, prod: dict, review_filter: str) -> bool:
+    sku = _primary_sku_from_product(prod)
+    if not sku:
+        return False
+    return _matches_review_filter(_local_review_status(review_store, sku), review_filter)
+
+
+def _fetch_review_filtered_products(
+    client,
+    review_store: ReviewStore,
+    *,
+    review_filter: str,
+    page_size: int,
+    page_idx: int,
+    shopify_query: str | None,
+    batch_size: int = 50,
+    max_batches: int = 250,
+) -> tuple[list[dict], bool]:
+    """Scan Shopify and return the next page_size products matching review_filter."""
+    skip_target = page_idx * page_size
+    collected: list[dict] = []
+    skipped = 0
+    after: str | None = None
+    seek_has_next = False
+
+    for _ in range(max_batches):
+        result = client.list_products(first=batch_size, after=after, query=shopify_query)
+        for prod in result.get("products") or []:
+            if not _product_matches_review_filter(review_store, prod, review_filter):
+                continue
+            if skipped < skip_target:
+                skipped += 1
+                continue
+            if not seek_has_next:
+                collected.append(prod)
+                if len(collected) >= page_size:
+                    seek_has_next = True
+                continue
+            return collected, True
+
+        page_info = result.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = str(page_info.get("endCursor") or "") or None
+        if not after:
+            break
+
+    return collected, False
+
+
+def _fetch_shopify_review_page(
+    client,
+    review_store: ReviewStore,
+    *,
+    review_filter: str,
+    page_size: int,
+    page_idx: int,
+    shopify_query: str | None,
+    cursors: list,
+) -> tuple[list[dict], bool, list]:
+    """Fetch one review page. Filtered modes return only matching products."""
+    if review_filter != "ALL":
+        products, has_next = _fetch_review_filtered_products(
+            client,
+            review_store,
+            review_filter=review_filter,
+            page_size=page_size,
+            page_idx=page_idx,
+            shopify_query=shopify_query,
+        )
+        return products, has_next, cursors
+
+    after = cursors[page_idx] if page_idx < len(cursors) else None
+    result = client.list_products(first=int(page_size), after=after, query=shopify_query)
+    products = list(result.get("products") or [])
+    page_info = result.get("pageInfo") or {}
+    has_next = bool(page_info.get("hasNextPage"))
+    if has_next:
+        end_cursor = str(page_info.get("endCursor") or "")
+        if end_cursor and page_idx + 1 >= len(cursors):
+            cursors = [*cursors, end_cursor]
+    return products, has_next, cursors
+
+
+def _approve_review_sku(
+    cfg,
+    review_store: ReviewStore,
+    *,
+    primary_sku: str,
+    product_id: str,
+    handle: str,
+    title: str,
+    category: str,
+    description: str,
+    tags: str,
+    prompt1_text: str,
+    prompt2_text: str,
+) -> tuple[int | None, int | None]:
+    """Approve local review state using latest workspace prompt versions."""
+    p1_ver, p2_ver = _latest_prompt_versions(cfg, primary_sku)
+    review_store.approve(
+        primary_sku,
+        title=title,
+        category=category,
+        product_type=category,
+        description=description,
+        tags=tags,
+        prompt1_version=p1_ver,
+        prompt2_version=p2_ver,
+        product_id=product_id,
+        handle=handle,
+    )
+    review_store.update(
+        primary_sku,
+        prompt1_text=prompt1_text,
+        prompt2_text=prompt2_text,
+    )
+    refresh_manifest(
+        outputs_dir=cfg.outputs_dir,
+        sku=primary_sku,
+        patch={"review_status": "approved"},
+    )
+    return p1_ver, p2_ver
+
+
 def _render_shopify_review(cfg) -> None:
     st.subheader("Shopify Inventory Review")
     st.caption(
@@ -844,19 +1030,27 @@ def _render_shopify_review(cfg) -> None:
         gen_client = _ensure_genai_client(cfg)
         st.caption(f"Model: {getattr(gen_client, 'model', cfg.model)}")
 
-    f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
+    f1, f2, f3, f4, f5 = st.columns([2, 1, 1, 1, 1])
     with f1:
         search = st.text_input("Search", value=st.session_state.get("shopify_review_search", ""), placeholder="title, SKU, handle...")
         st.session_state.shopify_review_search = search
     with f2:
-        status = st.selectbox("Status", ["ALL", "ACTIVE", "DRAFT", "ARCHIVED"], index=0, key="shopify_review_status")
+        status = st.selectbox("Shopify status", ["ALL", "ACTIVE", "DRAFT", "ARCHIVED"], index=0, key="shopify_review_status")
     with f3:
+        review_filter = st.selectbox(
+            "Review status",
+            ["ALL", "Pending review", "Approved", "Uploaded", "Failed"],
+            index=int(st.session_state.get("shopify_review_filter_idx", 1)),
+            key="shopify_review_status_filter",
+        )
+        st.session_state.shopify_review_filter_idx = ["ALL", "Pending review", "Approved", "Uploaded", "Failed"].index(review_filter)
+    with f4:
         product_type_filter = st.text_input("Product type", value=st.session_state.get("shopify_review_product_type", ""))
         st.session_state.shopify_review_product_type = product_type_filter
-    with f4:
+    with f5:
         page_size = st.selectbox("Per page", [5, 10, 15, 20], index=1, key="shopify_review_page_size")
 
-    filter_key = f"{search}|{status}|{product_type_filter}|{page_size}"
+    filter_key = f"{search}|{status}|{review_filter}|{product_type_filter}|{page_size}"
     if st.session_state.get("shopify_review_filter_key") != filter_key:
         st.session_state.shopify_review_filter_key = filter_key
         st.session_state.shopify_review_cursors = [None]
@@ -869,24 +1063,23 @@ def _render_shopify_review(cfg) -> None:
 
     cursors: list = st.session_state.shopify_review_cursors
     page_idx = int(st.session_state.shopify_review_page_idx)
-    after_cursor = cursors[page_idx] if page_idx < len(cursors) else None
     query = _build_shopify_product_query(search=search, status=status, product_type=product_type_filter)
 
     try:
-        result = client.list_products(first=int(page_size), after=after_cursor, query=query)
+        page_products, has_next, cursors = _fetch_shopify_review_page(
+            client,
+            review_store,
+            review_filter=review_filter,
+            page_size=int(page_size),
+            page_idx=page_idx,
+            shopify_query=query,
+            cursors=cursors,
+        )
+        st.session_state.shopify_review_cursors = cursors
     except Exception as e:
         st.error("Failed to fetch products from Shopify.")
         st.exception(e)
         return
-
-    products = result.get("products") or []
-    page_info = result.get("pageInfo") or {}
-    has_next = bool(page_info.get("hasNextPage"))
-    if has_next:
-        end_cursor = str(page_info.get("endCursor") or "")
-        if end_cursor and page_idx + 1 >= len(cursors):
-            cursors.append(end_cursor)
-            st.session_state.shopify_review_cursors = cursors
 
     nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 3])
     with nav1:
@@ -902,21 +1095,23 @@ def _render_shopify_review(cfg) -> None:
             st.session_state.shopify_review_page_idx = page_idx + 1
             st.rerun()
     with nav4:
-        st.caption(f"Page {page_idx + 1} — {len(products)} product(s)")
+        if review_filter == "ALL":
+            st.caption(f"Page {page_idx + 1} — {len(page_products)} product(s)")
+        else:
+            st.caption(f"Page {page_idx + 1} — {len(page_products)} `{review_filter}` product(s)")
 
-    if not products:
-        st.info("No products found for the current filters.")
+    if not page_products:
+        if review_filter == "ALL":
+            st.info("No products found for the current filters.")
+        else:
+            st.info(f"No `{review_filter}` products found. Try Previous/Next or change filters.")
         return
 
     gen_client = _ensure_genai_client(cfg)
 
-    for prod in products:
+    for prod in page_products:
         product_id = str(prod.get("id") or "")
         shop_title = str(prod.get("title") or "")
-        category = str(prod.get("category") or prod.get("product_type") or "")
-        product_type = str(prod.get("product_type") or category)
-        description_html = str(prod.get("description_html") or "")
-        description_plain = _strip_html(description_html, max_len=800)
         handle = str(prod.get("handle") or "")
         skus = prod.get("skus") or []
         media = prod.get("media") or []
@@ -926,15 +1121,15 @@ def _render_shopify_review(cfg) -> None:
 
         rec = review_store.get_record(primary_sku)
         review_status = str(rec.get("review_status") or "pending_review")
-        title_rec = title_store.get(primary_sku)
-        default_title = (
-            str(rec.get("title") or "").strip()
-            or str(title_rec.get("new_title") or title_rec.get("generated_title") or "").strip()
-            or shop_title
+        defaults = _review_field_defaults(
+            review_store=review_store,
+            title_store=title_store,
+            prod=prod,
+            primary_sku=primary_sku,
         )
 
         media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=primary_sku)
-        form_key = f"review_form::{product_id}::{primary_sku}"
+        form_key = _review_form_key(product_id, primary_sku)
 
         with _bordered_container():
             header = st.columns([4, 1])
@@ -948,22 +1143,22 @@ def _render_shopify_review(cfg) -> None:
             with header[1]:
                 st.caption(f"{len(media)} Shopify media")
 
-            edit_title = st.text_input("Title", value=default_title, key=f"title::{form_key}")
-            edit_category = st.text_input("Category / product type", value=product_type or category, key=f"cat::{form_key}")
+            edit_title = st.text_input("Title", value=defaults["title"], key=f"title::{form_key}")
+            edit_category = st.text_input("Category / product type", value=defaults["category"], key=f"cat::{form_key}")
             edit_description = st.text_area(
                 "Description",
-                value=str(rec.get("description") or description_plain),
+                value=defaults["description"],
                 key=f"desc::{form_key}",
                 height=100,
             )
-            edit_tags = st.text_input("Tags (comma-separated)", value=str(rec.get("tags") or ""), key=f"tags::{form_key}")
+            edit_tags = st.text_input("Tags (comma-separated)", value=defaults["tags"], key=f"tags::{form_key}")
 
             p1_key = f"prompt1::{form_key}"
             p2_key = f"prompt2::{form_key}"
             if p1_key not in st.session_state:
-                st.session_state[p1_key] = str(rec.get("prompt1_text") or PROMPT_1)
+                st.session_state[p1_key] = defaults["prompt1_text"]
             if p2_key not in st.session_state:
-                st.session_state[p2_key] = str(rec.get("prompt2_text") or PROMPT_2)
+                st.session_state[p2_key] = defaults["prompt2_text"]
             prompt1_text = st.text_area("Prompt 1 (lifestyle)", key=p1_key, height=80)
             prompt2_text = st.text_area("Prompt 2 (product/table thumbnail)", key=p2_key, height=80)
 
@@ -1049,45 +1244,39 @@ def _render_shopify_review(cfg) -> None:
                                 prompt_override=prompt2_text,
                             )
                         refresh_manifest(outputs_dir=cfg.outputs_dir, sku=primary_sku)
-                        st.success(f"Saved {out_path.name}")
+                        try:
+                            _rebuild_stock_export(cfg)
+                        except Exception as e:
+                            st.warning(f"XLSX rebuild failed: {e}")
+                        st.success(f"Saved {out_path.name} (thumbnail updated in workspace + XLSX).")
                         st.rerun()
                     except Exception as e:
                         st.error("prompt2 generation failed.")
                         st.exception(e)
 
-            p1_ver = media_idx.prompt1_versions[-1][0] if media_idx.prompt1_versions else None
-            p2_ver = media_idx.prompt2_versions[-1][0] if media_idx.prompt2_versions else None
+            p1_ver, p2_ver = _latest_prompt_versions(cfg, primary_sku)
 
             action_cols = st.columns(3)
             with action_cols[0]:
                 if st.button("Approve", key=f"approve::{form_key}", type="primary"):
-                    review_store.approve(
-                        primary_sku,
-                        title=edit_title,
-                        category=edit_category,
-                        product_type=edit_category,
-                        description=edit_description,
-                        tags=edit_tags,
-                        prompt1_version=p1_ver,
-                        prompt2_version=p2_ver,
+                    _approve_review_sku(
+                        cfg,
+                        review_store,
+                        primary_sku=primary_sku,
                         product_id=product_id,
                         handle=handle,
-                    )
-                    review_store.update(
-                        primary_sku,
+                        title=edit_title,
+                        category=edit_category,
+                        description=edit_description,
+                        tags=edit_tags,
                         prompt1_text=prompt1_text,
                         prompt2_text=prompt2_text,
-                    )
-                    refresh_manifest(
-                        outputs_dir=cfg.outputs_dir,
-                        sku=primary_sku,
-                        patch={"review_status": "approved"},
                     )
                     try:
                         _rebuild_stock_export(cfg)
                     except Exception as e:
                         st.warning(f"XLSX rebuild failed: {e}")
-                    st.success(f"Approved {primary_sku} locally.")
+                    st.success(f"Approved {primary_sku} (prompt1 v{p1_ver}, prompt2 v{p2_ver}).")
                     st.rerun()
             with action_cols[1]:
                 upload_disabled = review_status not in {"approved", "uploaded", "failed"} and not edit_title
@@ -1137,6 +1326,56 @@ def _render_shopify_review(cfg) -> None:
                 )
                 if str(rec.get("last_error") or "").strip():
                     st.caption(f"Last error: {rec.get('last_error')}")
+
+    st.divider()
+    bulk_col1, bulk_col2 = st.columns([1, 3])
+    with bulk_col1:
+        if st.button(
+            f"Bulk approve page ({len(page_products)})",
+            key=f"bulk_approve_page::{page_idx}::{review_filter}",
+            type="primary",
+        ):
+            approved_skus: list[str] = []
+            with st.spinner(f"Approving {len(page_products)} product(s) on this page..."):
+                for prod in page_products:
+                    product_id = str(prod.get("id") or "")
+                    handle = str(prod.get("handle") or "")
+                    skus = prod.get("skus") or []
+                    primary_sku = str(skus[0] if skus else prod.get("sku") or "").strip()
+                    if not primary_sku:
+                        continue
+                    defaults = _review_field_defaults(
+                        review_store=review_store,
+                        title_store=title_store,
+                        prod=prod,
+                        primary_sku=primary_sku,
+                    )
+                    form_key = _review_form_key(product_id, primary_sku)
+                    _approve_review_sku(
+                        cfg,
+                        review_store,
+                        primary_sku=primary_sku,
+                        product_id=product_id,
+                        handle=handle,
+                        title=str(st.session_state.get(f"title::{form_key}", defaults["title"])),
+                        category=str(st.session_state.get(f"cat::{form_key}", defaults["category"])),
+                        description=str(st.session_state.get(f"desc::{form_key}", defaults["description"])),
+                        tags=str(st.session_state.get(f"tags::{form_key}", defaults["tags"])),
+                        prompt1_text=str(st.session_state.get(f"prompt1::{form_key}", defaults["prompt1_text"])),
+                        prompt2_text=str(st.session_state.get(f"prompt2::{form_key}", defaults["prompt2_text"])),
+                    )
+                    approved_skus.append(primary_sku)
+            try:
+                _rebuild_stock_export(cfg)
+            except Exception as e:
+                st.warning(f"XLSX rebuild failed: {e}")
+            st.success(f"Bulk approved {len(approved_skus)} SKU(s): {', '.join(approved_skus)}")
+            st.rerun()
+    with bulk_col2:
+        st.caption(
+            "Approves every product shown on this page using the latest workspace images "
+            "(including regenerated prompt1/prompt2) and current field values, then rebuilds stock_enriched.xlsx."
+        )
 
 
 def _log_title_generation_cost(
