@@ -54,10 +54,19 @@ def iter_rows(
             target = rid_to_target.get(rid)
             if not name or not target:
                 continue
-            name_to_sheet_xml[name] = "xl/" + target.lstrip("/")
+            # Targets are usually "/xl/worksheets/sheetN.xml" — normalize to zip path.
+            sheet_path = target.lstrip("/")
+            if not sheet_path.startswith("xl/"):
+                sheet_path = "xl/" + sheet_path.lstrip("/")
+            name_to_sheet_xml[name] = sheet_path
 
         def cell_value(c: ET.Element) -> str:
             t = c.attrib.get("t")
+            if t == "inlineStr":
+                is_el = c.find("m:is", _NS)
+                if is_el is not None:
+                    return "".join(te.text or "" for te in is_el.findall(".//m:t", _NS))
+                return ""
             v = c.find("m:v", _NS)
             if v is None or v.text is None:
                 return ""

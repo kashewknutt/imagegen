@@ -216,11 +216,15 @@ def sync_product_media(
 
     video_count = 0
     for vp in videos or []:
-        if vp.is_file():
+        if not vp.is_file():
+            continue
+        try:
             upload_video_to_product(client, product_id=product_id, sku=sku, video_path=vp)
             log.info("[%s] Uploaded video %s", sku, vp.name)
             video_count += 1
-            time.sleep(0.5)
+        except Exception as e:
+            log.warning("[%s] Video upload failed for %s (images kept): %s", sku, vp.name, e)
+        time.sleep(0.5)
 
     media_ids = [str(m.get("id") or "") for m in attached if m.get("id")]
     return {

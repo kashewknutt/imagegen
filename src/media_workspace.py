@@ -458,6 +458,82 @@ def organize_all_from_source(
     return results
 
 
+def prune_prompt_versions_for_sku(
+    outputs_dir: Path,
+    sku: str,
+    *,
+    keep_prompt1_version: int | None = None,
+    keep_prompt2_version: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    """Keep one prompt1 and one prompt2 version; delete older files."""
+    sku_dir = sku_workspace_dir(outputs_dir, sku)
+    if not sku_dir.is_dir():
+        return {"sku": sku, "deleted": [], "kept": {}}
+
+    deleted: list[str] = []
+    kept: dict[str, str] = {}
+
+    for prompt_id, keep_v in (("prompt1", keep_prompt1_version), ("prompt2", keep_prompt2_version)):
+        versions = list_prompt_versions(sku_dir, prompt_id)
+        if not versions:
+            continue
+        if keep_v is None:
+            keep_v = versions[-1][0]
+        keep_path = None
+        for v, p in versions:
+            if v == keep_v:
+                keep_path = p
+            else:
+                if not dry_run:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                deleted.append(p.name)
+        if keep_path is not None:
+            kept[prompt_id] = keep_path.name
+
+    if deleted and not dry_run:
+        refresh_manifest(outputs_dir=outputs_dir, sku=sku)
+
+    return {"sku": sku, "deleted": deleted, "kept": kept}
+
+
+def prune_all_prompt_versions(
+    outputs_dir: Path,
+    *,
+    review_store: "ReviewStore | None" = None,
+    skus: list[str] | None = None,
+    dry_run: bool = False,
+) -> list[dict[str, object]]:
+    """Prune prompt versions for all workspace SKUs (or a provided list)."""
+    if skus is None:
+        skus = sorted(
+            p.name
+            for p in outputs_dir.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+    results: list[dict[str, object]] = []
+    for sku in skus:
+        p1 = p2 = None
+        if review_store is not None:
+            rec = review_store.get(sku)
+            if rec is not None:
+                p1 = rec.approved_prompt1_version
+                p2 = rec.approved_prompt2_version
+        results.append(
+            prune_prompt_versions_for_sku(
+                outputs_dir,
+                sku,
+                keep_prompt1_version=p1,
+                keep_prompt2_version=p2,
+                dry_run=dry_run,
+            )
+        )
+    return results
+
+
 def resolve_thumbnail_path(
     *,
     outputs_dir: Path,

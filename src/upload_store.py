@@ -79,3 +79,7 @@ class UploadStore:
         db[sku] = rec
         self._write(data)
         return self.get(sku)
+
+    def all_records(self) -> dict[str, dict[str, Any]]:
+        data = self._read()
+        return dict(data.get("skus") or {})

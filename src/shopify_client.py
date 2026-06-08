@@ -284,6 +284,26 @@ class ShopifyClient:
             "product_type": str(prod.get("productType") or product_type or ""),
         }
 
+    def product_delete(self, *, product_id: str) -> str:
+        """Hard-delete a product. Returns deleted product ID."""
+        mutation = """
+        mutation ProductDelete($input: ProductDeleteInput!) {
+          productDelete(input: $input) {
+            deletedProductId
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"input": {"id": product_id}})
+        payload = data.get("productDelete") or {}
+        errs = payload.get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"productDelete userErrors: {errs}")
+        deleted = str(payload.get("deletedProductId") or product_id)
+        if not deleted:
+            raise RuntimeError(f"productDelete returned no deletedProductId for {product_id}")
+        return deleted
+
     def product_update_status(self, *, product_id: str, status: str) -> None:
         """Set product status, e.g. ACTIVE, DRAFT, ARCHIVED."""
         mutation = """
@@ -379,7 +399,8 @@ class ShopifyClient:
         """
         inp: dict[str, Any] = {"resource": resource, "filename": filename, "mimeType": mime_type, "httpMethod": http_method}
         if file_size is not None:
-            inp["fileSize"] = int(file_size)
+            # Shopify UnsignedInt64 GraphQL scalars must be sent as strings.
+            inp["fileSize"] = str(int(file_size))
         data = self.graphql(query, {"input": [inp]})
         payload = (data.get("stagedUploadsCreate") or {})
         errs = payload.get("userErrors") or []
@@ -474,20 +495,11 @@ class ShopifyClient:
         return last
 
     def product_set_featured_media(self, *, product_id: str, media_id: str) -> None:
-        """Set the product thumbnail/featured image to an existing media item."""
-        mutation = """
-        mutation ProductSetFeaturedMedia($input: ProductInput!) {
-          productUpdate(input: $input) {
-            product { id featuredImage { url } }
-            userErrors { field message }
-          }
-        }
-        """
-        data = self.graphql(mutation, {"input": {"id": product_id, "featuredMediaId": media_id}})
-        payload = data.get("productUpdate") or {}
-        errs = payload.get("userErrors") or []
-        if errs:
-            raise RuntimeError(f"productUpdate featuredMediaId userErrors: {errs}")
+        """Set the product thumbnail by moving media to position 0 (prompt2 is uploaded first)."""
+        self.product_reorder_media(
+            product_id=product_id,
+            moves=[{"id": media_id, "newPosition": "0"}],
+        )
 
     def product_reorder_media(self, *, product_id: str, moves: list[dict[str, str]]) -> None:
         """Reorder product media. Each move: {id: media_id, newPosition: \"0\"}."""

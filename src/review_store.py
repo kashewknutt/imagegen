@@ -165,6 +165,21 @@ class ReviewStore:
             last_error=str(error)[:2000],
         )
 
+    def reset_uploaded_to_approved(self) -> int:
+        """Demote all uploaded SKUs back to approved (clears upload tracking, keeps titles/media picks)."""
+        count = 0
+        for sku, rec in self.all_records().items():
+            if str(rec.get("review_status") or "") != "uploaded":
+                continue
+            self.update(
+                sku,
+                review_status="approved",
+                upload_status="pending",
+                last_error="",
+            )
+            count += 1
+        return count
+
     def all_records(self) -> dict[str, dict[str, Any]]:
         data = self._read()
         return dict(data.get("skus") or {})
