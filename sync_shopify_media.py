@@ -34,12 +34,16 @@ def _featured_is_raw_only(*, sku: str, featured_url: str) -> bool:
 
 
 def _needs_sync(*, cfg, sku: str, product: dict) -> tuple[bool, int, int]:
-    expected = images_for_sku(cfg, sku)
+    from src.shopify_media_sync import media_paths_for_sku
+
+    expected_images = images_for_sku(cfg, sku)
+    paths = media_paths_for_sku(cfg, sku)
+    expected_count = len(expected_images) + len(paths.get("videos") or [])
     actual = list(product.get("media") or [])
     featured = str(product.get("featured_image_url") or "")
-    ok_count = len(actual) >= len(expected)
+    ok_count = len(actual) >= expected_count
     ok_thumb = not _featured_is_raw_only(sku=sku, featured_url=featured)
-    return (not ok_count or not ok_thumb), len(actual), len(expected)
+    return (not ok_count or not ok_thumb), len(actual), expected_count
 
 
 def main() -> int:
@@ -99,23 +103,39 @@ def main() -> int:
     ok = 0
     failed = 0
     for i, (sku, product_id) in enumerate(targets, start=1):
+        from src.shopify_media_sync import media_paths_for_sku
+
         images = images_for_sku(cfg, sku)
+        paths = media_paths_for_sku(cfg, sku)
         if not images:
             log.error("[%d/%d] %s — no local images", i, len(targets), sku)
             failed += 1
             continue
-        log.info("[%d/%d] Syncing %s (%d images)...", i, len(targets), sku, len(images))
+        log.info(
+            "[%d/%d] Syncing %s (%d images, %d videos)...",
+            i,
+            len(targets),
+            sku,
+            len(images),
+            len(paths.get("videos") or []),
+        )
         try:
             existing_ids = [str(m.get("id") or "") for m in (by_sku.get(sku) or {}).get("media") or []]
-            n = sync_product_media(
+            result = sync_product_media(
                 client,
                 product_id=product_id,
                 sku=sku,
                 images=images,
+                videos=paths.get("videos"),
                 replace_existing=True,
                 existing_media_ids=existing_ids,
             )
-            log.info("[%s] Synced %d media item(s); prompt2 is thumbnail", sku, n)
+            log.info(
+                "[%s] Synced %d image(s), %d video(s); prompt2 is thumbnail",
+                sku,
+                result.get("image_count", 0),
+                result.get("video_count", 0),
+            )
             ok += 1
         except Exception as e:
             log.error("[%s] Sync failed: %s", sku, e)

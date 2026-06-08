@@ -18,6 +18,7 @@ from src.pipeline import (
     PROMPT_2,
     generate_pair,
     generate_single_replacement,
+    generate_to_workspace,
     write_missing_report,
     approve_many,
     skip,
@@ -26,6 +27,9 @@ from src.pipeline import (
     prepare_work_item_for_paths,
     prepare_work_item_from_url,
 )
+from src.media_workspace import index_sku_media, organize_sku_from_source, refresh_manifest
+from src.review_store import ReviewStore
+from src.shopify_media_sync import images_for_sku, media_paths_for_sku, update_shopify_product_from_review
 from src.folder_ingest import iter_groups
 from src.name_group import base_key_from_path
 from src.cost_log import append_cost_row, make_generate_row, estimate_cost_usd, extract_image_modality_tokens
@@ -749,9 +753,58 @@ def _render_gallery(cfg) -> None:
                         st.warning("Missing prompt2 output")
 
 
+def _review_store(cfg) -> ReviewStore:
+    return ReviewStore(cfg.outputs_dir / "review_state.json")
+
+
+def _rebuild_stock_export(cfg) -> int:
+    from build_stock_export import build_export
+    from dedupe_titles_and_upload import product_names_from_store
+
+    product_names: dict[str, str] = {}
+    names_path = cfg.outputs_dir / "title_gen_state.json"
+    if names_path.is_file():
+        product_names.update(product_names_from_store(TitleStore(names_path)))
+
+    review_store = _review_store(cfg)
+    prompt2_versions: dict[str, int | None] = {}
+    for sku, rec in review_store.all_records().items():
+        t = str(rec.get("title") or "").strip()
+        if t:
+            product_names[sku] = t
+        p2 = rec.get("approved_prompt2_version")
+        if p2 is not None:
+            prompt2_versions[sku] = int(p2)
+
+    root = Path(__file__).resolve().parent
+    return build_export(
+        stock_path=cfg.xlsx_path,
+        products_path=root / "products_export_1.xlsx",
+        outputs_dir=cfg.outputs_dir,
+        output_path=cfg.outputs_dir / "stock_enriched.xlsx",
+        stock_sheets=cfg.xlsx_sheets,
+        product_names=product_names or None,
+        images_dir=cfg.images_dir,
+        prompt2_versions=prompt2_versions or None,
+    )
+
+
+def _review_status_badge(status: str) -> str:
+    colors = {
+        "pending_review": "🟡",
+        "approved": "🟢",
+        "uploaded": "✅",
+        "failed": "🔴",
+    }
+    return f"{colors.get(status, '⚪')} `{status}`"
+
+
 def _render_shopify_review(cfg) -> None:
     st.subheader("Shopify Inventory Review")
-    st.caption("Browse live Shopify products, view all images per product, and delete or replace images inline.")
+    st.caption(
+        "Review local workspace media (raw, generated, video) against live Shopify products. "
+        "Approve edits locally, then upload the full media set."
+    )
 
     _render_shopify_connection_sidebar(cfg)
     client = _shopify_client_from_session(cfg)
@@ -759,7 +812,33 @@ def _render_shopify_review(cfg) -> None:
         st.warning("Connect Shopify in the sidebar (domain + token), then return here.")
         return
 
+    review_store = _review_store(cfg)
+    title_store = TitleStore(cfg.outputs_dir / "title_gen_state.json")
+
     with st.sidebar:
+        st.divider()
+        st.subheader("Workspace")
+        if st.button("Organize DAIJE → outputs", width="stretch"):
+            with st.spinner("Organizing media..."):
+                from src.media_workspace import scan_source_dir
+
+                grouped = scan_source_dir(cfg.images_dir)
+                n = 0
+                for sku in sorted(grouped.keys()):
+                    organize_sku_from_source(
+                        source_dir=cfg.images_dir,
+                        outputs_dir=cfg.outputs_dir,
+                        sku=sku,
+                        copy=True,
+                        dry_run=False,
+                    )
+                    n += 1
+            st.success(f"Organized media for {n} SKU(s).")
+            st.rerun()
+        if st.button("Rebuild stock_enriched.xlsx", width="stretch"):
+            with st.spinner("Rebuilding XLSX..."):
+                count = _rebuild_stock_export(cfg)
+            st.success(f"Rebuilt stock_enriched.xlsx ({count} rows).")
         st.divider()
         st.subheader("Generation")
         gen_client = _ensure_genai_client(cfg)
@@ -791,7 +870,6 @@ def _render_shopify_review(cfg) -> None:
     cursors: list = st.session_state.shopify_review_cursors
     page_idx = int(st.session_state.shopify_review_page_idx)
     after_cursor = cursors[page_idx] if page_idx < len(cursors) else None
-
     query = _build_shopify_product_query(search=search, status=status, product_type=product_type_filter)
 
     try:
@@ -830,151 +908,235 @@ def _render_shopify_review(cfg) -> None:
         st.info("No products found for the current filters.")
         return
 
-    st.caption(f"Showing {len(products)} product(s) on this page.")
-
     gen_client = _ensure_genai_client(cfg)
 
     for prod in products:
         product_id = str(prod.get("id") or "")
-        title = str(prod.get("title") or "")
+        shop_title = str(prod.get("title") or "")
         category = str(prod.get("category") or prod.get("product_type") or "")
-        description = _strip_html(str(prod.get("description_html") or ""), max_len=800)
+        product_type = str(prod.get("product_type") or category)
+        description_html = str(prod.get("description_html") or "")
+        description_plain = _strip_html(description_html, max_len=800)
         handle = str(prod.get("handle") or "")
         skus = prod.get("skus") or []
         media = prod.get("media") or []
+        primary_sku = str(skus[0] if skus else prod.get("sku") or "").strip()
+        if not primary_sku:
+            continue
+
+        rec = review_store.get_record(primary_sku)
+        review_status = str(rec.get("review_status") or "pending_review")
+        title_rec = title_store.get(primary_sku)
+        default_title = (
+            str(rec.get("title") or "").strip()
+            or str(title_rec.get("new_title") or title_rec.get("generated_title") or "").strip()
+            or shop_title
+        )
+
+        media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=primary_sku)
+        form_key = f"review_form::{product_id}::{primary_sku}"
 
         with _bordered_container():
             header = st.columns([4, 1])
             with header[0]:
-                st.markdown(f"### {title}")
-                sku_text = ", ".join(skus) if skus else "—"
-                st.caption(f"Category: `{category}` | Handle: `{handle}` | SKU: `{sku_text}` | Status: `{prod.get('status', '')}`")
+                st.markdown(f"### {shop_title}")
+                sku_text = ", ".join(skus) if skus else primary_sku
+                st.caption(
+                    f"SKU: `{sku_text}` | Handle: `{handle}` | Shopify status: `{prod.get('status', '')}` | "
+                    f"Review: {_review_status_badge(review_status)}"
+                )
             with header[1]:
-                st.caption(f"{len(media)} image(s)")
+                st.caption(f"{len(media)} Shopify media")
 
-            if description:
-                st.markdown(description)
-            else:
-                st.caption("No description.")
+            edit_title = st.text_input("Title", value=default_title, key=f"title::{form_key}")
+            edit_category = st.text_input("Category / product type", value=product_type or category, key=f"cat::{form_key}")
+            edit_description = st.text_area(
+                "Description",
+                value=str(rec.get("description") or description_plain),
+                key=f"desc::{form_key}",
+                height=100,
+            )
+            edit_tags = st.text_input("Tags (comma-separated)", value=str(rec.get("tags") or ""), key=f"tags::{form_key}")
 
-            if not media:
-                st.warning("No images on this product.")
-                continue
+            p1_key = f"prompt1::{form_key}"
+            p2_key = f"prompt2::{form_key}"
+            if p1_key not in st.session_state:
+                st.session_state[p1_key] = str(rec.get("prompt1_text") or PROMPT_1)
+            if p2_key not in st.session_state:
+                st.session_state[p2_key] = str(rec.get("prompt2_text") or PROMPT_2)
+            prompt1_text = st.text_area("Prompt 1 (lifestyle)", key=p1_key, height=80)
+            prompt2_text = st.text_area("Prompt 2 (product/table thumbnail)", key=p2_key, height=80)
 
-            for idx, m in enumerate(media):
-                media_id = str(m.get("id") or "")
-                media_url = str(m.get("url") or "")
-                media_alt = str(m.get("alt") or "")
-                if not media_id:
-                    continue
+            st.markdown("#### Local workspace")
+            ws_cols = st.columns(4)
+            with ws_cols[0]:
+                st.caption(f"Raw ({len(media_idx.raw_images)})")
+                for rp in media_idx.raw_images[:4]:
+                    img = _safe_open_image(rp)
+                    if img:
+                        st.image(img, width=140, caption=rp.name)
+                if len(media_idx.raw_images) > 4:
+                    st.caption(f"+{len(media_idx.raw_images) - 4} more")
+            with ws_cols[1]:
+                st.caption(f"prompt1 ({len(media_idx.prompt1_versions)})")
+                for v, pp in media_idx.prompt1_versions:
+                    img = _safe_open_image(pp)
+                    if img:
+                        st.image(img, width=140, caption=f"v{v}")
+            with ws_cols[2]:
+                st.caption(f"prompt2 ({len(media_idx.prompt2_versions)})")
+                for v, pp in media_idx.prompt2_versions:
+                    img = _safe_open_image(pp)
+                    if img:
+                        st.image(img, width=140, caption=f"v{v} (thumbnail)")
+            with ws_cols[3]:
+                st.caption(f"Videos ({len(media_idx.videos)})")
+                for vp in media_idx.videos:
+                    st.video(str(vp))
+                    st.caption(vp.name)
 
-                repl_key = f"review_replacement::{product_id}::{media_id}"
-                action_key = f"{product_id}::{media_id}"
+            if media:
+                st.markdown("#### Shopify media")
+                shop_cols = st.columns(min(len(media), 4))
+                for i, m in enumerate(media[:4]):
+                    with shop_cols[i % len(shop_cols)]:
+                        url = str(m.get("url") or "")
+                        if url:
+                            st.image(url, width=140, caption=str(m.get("alt") or f"media {i+1}"))
+                if len(media) > 4:
+                    st.caption(f"+{len(media) - 4} more on Shopify")
 
-                st.markdown("---")
-                img_col, act_col = st.columns([1, 2])
-                with img_col:
-                    st.caption(f"Image {idx + 1}" + (f" — {media_alt}" if media_alt else ""))
-                    if media_url:
-                        st.image(media_url, width=220)
-                    else:
-                        st.warning("Image URL unavailable")
+            gen_cols = st.columns(2)
+            ref_path = media_idx.raw_images[0] if media_idx.raw_images else None
+            if ref_path is None:
+                refs = _list_candidates_for_key(cfg.images_dir, primary_sku)
+                ref_path = refs[0] if refs else None
 
-                with act_col:
-                    style = st.radio(
-                        "Replacement style",
-                        ["product", "lifestyle"],
-                        horizontal=True,
-                        key=f"style::{action_key}",
-                        format_func=lambda x: "Product shot" if x == "product" else "Lifestyle",
+            with gen_cols[0]:
+                if st.button("Regenerate prompt1", key=f"gen_p1::{form_key}", disabled=ref_path is None):
+                    try:
+                        work = prepare_work_item_for_path(cfg, primary_sku, ref_path)
+                        extra = f"Product title: {edit_title}\nCategory: {edit_category}"
+                        with st.spinner("Generating prompt1..."):
+                            out_path, _meta = generate_to_workspace(
+                                cfg,
+                                gen_client,
+                                work,
+                                prompt_slot="prompt1",
+                                prompt_style="lifestyle",
+                                extra_context=extra,
+                                prompt_override=prompt1_text,
+                            )
+                        refresh_manifest(outputs_dir=cfg.outputs_dir, sku=primary_sku)
+                        st.success(f"Saved {out_path.name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("prompt1 generation failed.")
+                        st.exception(e)
+            with gen_cols[1]:
+                if st.button("Regenerate prompt2", key=f"gen_p2::{form_key}", disabled=ref_path is None):
+                    try:
+                        work = prepare_work_item_for_path(cfg, primary_sku, ref_path)
+                        extra = f"Product title: {edit_title}\nCategory: {edit_category}"
+                        with st.spinner("Generating prompt2..."):
+                            out_path, _meta = generate_to_workspace(
+                                cfg,
+                                gen_client,
+                                work,
+                                prompt_slot="prompt2",
+                                prompt_style="product",
+                                extra_context=extra,
+                                prompt_override=prompt2_text,
+                            )
+                        refresh_manifest(outputs_dir=cfg.outputs_dir, sku=primary_sku)
+                        st.success(f"Saved {out_path.name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("prompt2 generation failed.")
+                        st.exception(e)
+
+            p1_ver = media_idx.prompt1_versions[-1][0] if media_idx.prompt1_versions else None
+            p2_ver = media_idx.prompt2_versions[-1][0] if media_idx.prompt2_versions else None
+
+            action_cols = st.columns(3)
+            with action_cols[0]:
+                if st.button("Approve", key=f"approve::{form_key}", type="primary"):
+                    review_store.approve(
+                        primary_sku,
+                        title=edit_title,
+                        category=edit_category,
+                        product_type=edit_category,
+                        description=edit_description,
+                        tags=edit_tags,
+                        prompt1_version=p1_ver,
+                        prompt2_version=p2_ver,
+                        product_id=product_id,
+                        handle=handle,
                     )
-                    prompt_state_key = f"prompt::{action_key}"
-                    style_cache_key = f"prompt_style_cache::{action_key}"
-                    default_prompt = PROMPT_2 if style == "product" else PROMPT_1
-                    if st.session_state.get(style_cache_key) != style:
-                        st.session_state[prompt_state_key] = default_prompt
-                        st.session_state[style_cache_key] = style
-                    if prompt_state_key not in st.session_state:
-                        st.session_state[prompt_state_key] = default_prompt
-                    prompt_override = st.text_area(
-                        "Prompt (editable for this generation only)",
-                        key=prompt_state_key,
-                        height=120,
+                    review_store.update(
+                        primary_sku,
+                        prompt1_text=prompt1_text,
+                        prompt2_text=prompt2_text,
                     )
-                    reset_cols = st.columns([1, 3])
-                    with reset_cols[0]:
-                        if st.button("Reset prompt", key=f"reset_prompt::{action_key}"):
-                            st.session_state[prompt_state_key] = default_prompt
-                            st.rerun()
-                    btn_cols = st.columns(3)
-                    with btn_cols[0]:
-                        if st.button("Delete", key=f"del::{action_key}", type="secondary"):
-                            try:
-                                with st.spinner("Deleting image..."):
-                                    client.delete_product_media(product_id=product_id, media_ids=[media_id])
-                                if repl_key in st.session_state:
-                                    del st.session_state[repl_key]
-                                st.success("Image deleted.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error("Delete failed.")
-                                st.exception(e)
-                    with btn_cols[1]:
-                        if st.button("Generate replacement", key=f"gen::{action_key}", type="primary"):
-                            if not media_url:
-                                st.error("Cannot generate: image URL missing.")
-                            else:
-                                try:
-                                    work_key = f"review_{handle or product_id}_{media_id[-8:]}"
-                                    extra = f"Product title: {title}\nCategory: {category}"
-                                    with st.spinner("Generating replacement image..."):
-                                        work = prepare_work_item_from_url(cfg, work_key, media_url)
-                                        out_path, meta = generate_single_replacement(
-                                            cfg,
-                                            gen_client,
-                                            work,
-                                            attempt=1,
-                                            prompt_style=style,
-                                            extra_context=extra,
-                                            prompt_override=prompt_override,
-                                            output_suffix=f"replace_{idx}",
-                                        )
-                                    st.session_state[repl_key] = {"path": str(out_path), "meta": meta, "style": style}
-                                    st.success("Replacement generated. Review below, then click Replace in Shopify.")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error("Generation failed.")
-                                    st.exception(e)
-                    with btn_cols[2]:
-                        repl = st.session_state.get(repl_key)
-                        replace_disabled = not (isinstance(repl, dict) and repl.get("path") and Path(str(repl["path"])).exists())
-                        if st.button("Replace in Shopify", key=f"replace::{action_key}", disabled=replace_disabled):
-                            repl_path = Path(str(repl["path"]))
-                            try:
-                                mime = "image/jpeg" if repl_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
-                                with st.spinner("Uploading replacement and removing old image..."):
-                                    client.replace_product_image(
-                                        product_id=product_id,
-                                        old_media_id=media_id,
-                                        file_bytes=repl_path.read_bytes(),
-                                        filename=repl_path.name,
-                                        mime_type=mime,
-                                        alt=media_alt or title,
-                                    )
-                                if repl_key in st.session_state:
-                                    del st.session_state[repl_key]
-                                st.success("Image replaced in Shopify.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error("Replace failed.")
-                                st.exception(e)
-
-                repl = st.session_state.get(repl_key)
-                if isinstance(repl, dict) and repl.get("path"):
-                    repl_path = Path(str(repl["path"]))
-                    if repl_path.exists():
-                        st.caption(f"Generated candidate ({repl.get('style', 'product')})")
-                        st.image(_load_image(repl_path), width=220)
+                    refresh_manifest(
+                        outputs_dir=cfg.outputs_dir,
+                        sku=primary_sku,
+                        patch={"review_status": "approved"},
+                    )
+                    try:
+                        _rebuild_stock_export(cfg)
+                    except Exception as e:
+                        st.warning(f"XLSX rebuild failed: {e}")
+                    st.success(f"Approved {primary_sku} locally.")
+                    st.rerun()
+            with action_cols[1]:
+                upload_disabled = review_status not in {"approved", "uploaded", "failed"} and not edit_title
+                if st.button("Upload / Update Shopify", key=f"upload::{form_key}", disabled=not product_id):
+                    try:
+                        tags_list = [t.strip() for t in edit_tags.split(",") if t.strip()]
+                        existing_ids = [str(m.get("id") or "") for m in media if m.get("id")]
+                        with st.spinner("Updating Shopify product and media..."):
+                            result = update_shopify_product_from_review(
+                                client,
+                                cfg,
+                                sku=primary_sku,
+                                product_id=product_id,
+                                title=edit_title,
+                                product_type=edit_category,
+                                description_html=edit_description.replace("\n", "<br>") if edit_description and "<" not in edit_description else edit_description,
+                                tags=tags_list or None,
+                                review_store=review_store,
+                                existing_media_ids=existing_ids,
+                                replace_media=True,
+                            )
+                        review_store.mark_uploaded(
+                            primary_sku,
+                            shopify_media_ids=result.get("media_ids") or [],
+                        )
+                        title_store.update(
+                            primary_sku,
+                            sku=primary_sku,
+                            product_id=product_id,
+                            new_title=edit_title,
+                        )
+                        _rebuild_stock_export(cfg)
+                        st.success(
+                            f"Uploaded {result.get('image_count', 0)} image(s) and "
+                            f"{result.get('video_count', 0)} video(s) for {primary_sku}."
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        review_store.mark_failed(primary_sku, str(e))
+                        st.error("Upload failed.")
+                        st.exception(e)
+            with action_cols[2]:
+                expected = images_for_sku(cfg, primary_sku, review_store=review_store)
+                paths = media_paths_for_sku(cfg, primary_sku, review_store=review_store)
+                st.caption(
+                    f"Upload set: {len(expected)} image(s), {len(paths.get('videos') or [])} video(s)"
+                )
+                if str(rec.get("last_error") or "").strip():
+                    st.caption(f"Last error: {rec.get('last_error')}")
 
 
 def _log_title_generation_cost(

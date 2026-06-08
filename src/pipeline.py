@@ -280,3 +280,56 @@ def generate_single_replacement(
 
     img.save(out_path)
     return out_path, result_meta
+
+
+def generate_to_workspace(
+    cfg: AppConfig,
+    client: GenAiImageClient,
+    work: WorkItem,
+    *,
+    prompt_slot: str = "prompt2",
+    attempt: int = 1,
+    prompt_style: str = "product",
+    extra_context: str = "",
+    prompt_override: str | None = None,
+) -> tuple[Path, dict]:
+    """
+    Generate prompt1 or prompt2 and save to outputs/{SKU}/{prompt_slot}_vN.jpg.
+    """
+    prompt_slot = prompt_slot.strip().lower()
+    if prompt_slot not in {"prompt1", "prompt2"}:
+        raise ValueError(f"prompt_slot must be prompt1 or prompt2, got {prompt_slot}")
+
+    from src.media_workspace import list_prompt_versions, refresh_manifest
+
+    sku_dir = cfg.outputs_dir / work.key
+    sku_dir.mkdir(parents=True, exist_ok=True)
+    versions = list_prompt_versions(sku_dir, prompt_slot)
+    next_v = (versions[-1][0] + 1) if versions else 1
+    ext = cfg.output_format if cfg.output_format != "jpg" else "jpg"
+    out_path = sku_dir / f"{prompt_slot}_v{next_v}.{ext}"
+
+    style = "lifestyle" if prompt_slot == "prompt1" else "product"
+    if prompt_style:
+        style = prompt_style
+
+    import shutil
+
+    temp_path, meta = generate_single_replacement(
+        cfg,
+        client,
+        work,
+        attempt=attempt,
+        prompt_style=style,
+        extra_context=extra_context,
+        prompt_override=prompt_override,
+        output_suffix=f"{prompt_slot}_v{next_v}",
+    )
+    final_path = sku_dir / f"{prompt_slot}_v{next_v}.{ext}"
+    if temp_path.resolve() != final_path.resolve():
+        shutil.move(str(temp_path), str(final_path))
+
+    meta["workspace_version"] = next_v
+    meta["workspace_path"] = str(final_path)
+    refresh_manifest(outputs_dir=cfg.outputs_dir, sku=work.key)
+    return final_path, meta

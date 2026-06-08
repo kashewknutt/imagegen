@@ -15,7 +15,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 
-from src.image_resolve import find_local_image
+from src.media_workspace import resolve_thumbnail_path, thumbnail_relative_path
 from src.sku_aliases import canonical_sku
 from src.xlsx_ingest import iter_rows
 
@@ -59,19 +59,22 @@ def _thumbnail_image_name(*, category: str, sku: str) -> str:
     return " ".join(parts)
 
 
-def _thumbnail_image_path(*, outputs_dir: Path, sku: str, images_dir: Path | None = None) -> Path | None:
-    """prompt2 thumbnail, else first matching raw photo for embedded thumbnailImage cells."""
+def _thumbnail_image_path(
+    *,
+    outputs_dir: Path,
+    sku: str,
+    images_dir: Path | None = None,
+    prompt2_version: int | None = None,
+) -> Path | None:
+    """prompt2 thumbnail (approved/latest), else raw fallback for embedded cells."""
     if not sku:
         return None
-    for candidate in {sku, canonical_sku(sku)}:
-        thumb = outputs_dir / candidate / "prompt2_v1.jpg"
-        if thumb.is_file():
-            return thumb
-    if images_dir is not None:
-        raw = find_local_image(images_dir, sku, "")
-        if raw and raw.is_file():
-            return raw
-    return None
+    return resolve_thumbnail_path(
+        outputs_dir=outputs_dir,
+        sku=sku,
+        images_dir=images_dir,
+        prompt2_version=prompt2_version,
+    )
 
 
 def _product_name_for_sku(*, sku: str, overrides: dict[str, str], title_by_sku: dict[str, str]) -> str:
@@ -90,13 +93,20 @@ def _supplementary_rows(
     overrides: dict[str, str],
     outputs_dir: Path,
     images_dir: Path | None,
+    prompt2_versions: dict[str, int | None] | None = None,
 ) -> list[dict[str, object]]:
     """Rows for titled SKUs with images that are missing from Stock.xlsx."""
     extra: list[dict[str, object]] = []
     for sku in sorted(overrides):
         if not overrides.get(sku) or sku in stock_skus:
             continue
-        if not _thumbnail_image_path(outputs_dir=outputs_dir, sku=sku, images_dir=images_dir):
+        p2v = (prompt2_versions or {}).get(sku)
+        if not _thumbnail_image_path(
+            outputs_dir=outputs_dir,
+            sku=sku,
+            images_dir=images_dir,
+            prompt2_version=p2v,
+        ):
             continue
         row = {col: "" for col in stock_columns}
         row["SKU"] = sku
@@ -111,6 +121,7 @@ def _embed_thumbnail_images(
     images_dir: Path | None,
     sku_col_idx: int,
     image_col_idx: int,
+    prompt2_versions: dict[str, int | None] | None = None,
     start_row: int = 2,
 ) -> int:
     """Embed thumbnails in thumbnailImage column cells. Returns count embedded."""
@@ -119,7 +130,13 @@ def _embed_thumbnail_images(
     embedded = 0
     for row_idx in range(start_row, ws.max_row + 1):
         sku = _norm_sku(ws.cell(row=row_idx, column=sku_col_idx).value)
-        path = _thumbnail_image_path(outputs_dir=outputs_dir, sku=sku, images_dir=images_dir)
+        p2v = (prompt2_versions or {}).get(sku)
+        path = _thumbnail_image_path(
+            outputs_dir=outputs_dir,
+            sku=sku,
+            images_dir=images_dir,
+            prompt2_version=p2v,
+        )
         if path is None:
             continue
         img = XLImage(str(path))
@@ -144,6 +161,7 @@ def build_export(
     stock_sheets: list[str] | None = None,
     product_names: dict[str, str] | None = None,
     images_dir: Path | None = None,
+    prompt2_versions: dict[str, int | None] | None = None,
 ) -> int:
     sheets = stock_sheets or ["Total"]
     stock_rows = iter_rows(stock_path, sheets)
@@ -157,6 +175,7 @@ def build_export(
     extra_columns = [
         "productName",
         "thumbnailImage",
+        "thumbnail image path",
         "thumbnailImageName",
         "productDescription",
         "hashtag/keyword",
@@ -170,6 +189,7 @@ def build_export(
 
     sku_col_idx = headers.index("SKU") + 1
     image_col_idx = headers.index("thumbnailImage") + 1
+    thumb_path_col_idx = headers.index("thumbnail image path") + 1
     stock_skus = {_norm_sku(r.values.get("SKU")) for r in stock_rows if _norm_sku(r.values.get("SKU"))}
 
     all_rows: list[tuple[dict[str, object], str]] = []
@@ -181,6 +201,7 @@ def build_export(
         overrides=overrides,
         outputs_dir=outputs_dir,
         images_dir=images_dir,
+        prompt2_versions=prompt2_versions,
     ):
         cat = str(vals.get("category") or "").strip()
         if not cat:
@@ -199,9 +220,12 @@ def build_export(
         sku = _norm_sku(vals.get("SKU"))
 
         base = [vals.get(col, "") for col in stock_columns]
+        p2v = (prompt2_versions or {}).get(sku)
+        thumb_rel = thumbnail_relative_path(outputs_dir=outputs_dir, sku=sku, prompt2_version=p2v)
         extras = [
             _product_name_for_sku(sku=sku, overrides=overrides, title_by_sku=title_by_sku),
             "",  # image embedded after save prep, not a path string
+            thumb_rel,
             _thumbnail_image_name(category=category, sku=sku),
             "",
             "",
@@ -214,7 +238,17 @@ def build_export(
         images_dir=images_dir,
         sku_col_idx=sku_col_idx,
         image_col_idx=image_col_idx,
+        prompt2_versions=prompt2_versions,
     )
+
+    for row_idx in range(2, ws.max_row + 1):
+        sku = _norm_sku(ws.cell(row=row_idx, column=sku_col_idx).value)
+        if not sku:
+            continue
+        p2v = (prompt2_versions or {}).get(sku)
+        thumb_rel = thumbnail_relative_path(outputs_dir=outputs_dir, sku=sku, prompt2_version=p2v)
+        if thumb_rel:
+            ws.cell(row=row_idx, column=thumb_path_col_idx).value = thumb_rel
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -240,12 +274,26 @@ def main() -> None:
 
     cfg = load_config()
     names_path = cfg.outputs_dir / "title_gen_state.json"
-    product_names = None
+    product_names: dict[str, str] = {}
     if names_path.is_file():
         from dedupe_titles_and_upload import product_names_from_store
         from src.title_store import TitleStore
 
         product_names = product_names_from_store(TitleStore(names_path))
+
+    review_path = cfg.outputs_dir / "review_state.json"
+    prompt2_versions: dict[str, int | None] = {}
+    if review_path.is_file():
+        from src.review_store import ReviewStore
+
+        review_store = ReviewStore(review_path)
+        for sku, rec in review_store.all_records().items():
+            approved_title = str(rec.get("title") or "").strip()
+            if approved_title:
+                product_names[sku] = approved_title
+            p2 = rec.get("approved_prompt2_version")
+            if p2 is not None:
+                prompt2_versions[sku] = int(p2)
 
     count = build_export(
         stock_path=args.stock,
@@ -253,8 +301,9 @@ def main() -> None:
         outputs_dir=args.outputs_dir,
         output_path=args.output,
         stock_sheets=args.sheet,
-        product_names=product_names,
+        product_names=product_names or None,
         images_dir=cfg.images_dir,
+        prompt2_versions=prompt2_versions or None,
     )
     print(f"Wrote {count} rows to {args.output}")
 

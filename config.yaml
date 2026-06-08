@@ -1,6 +1,6 @@
 # Main inputs
 csv_path: "/Users/kashewknutt/Projects/imagegen/1.csv"
-images_dir: "/Users/kashewknutt/Projects/imagegen/pics_raw"
+images_dir: "/Users/kashewknutt/Projects/imagegen/DAIJE"
 # input_mode: "csv" (use csv_path) or "folder" (use images_dir only)
 input_mode: "xlsx"
 xlsx_path: "Stock.xlsx"

@@ -237,15 +237,41 @@ class ShopifyClient:
 
     def product_update_title(self, *, product_id: str, title: str) -> dict[str, str]:
         """Update a product's title via productUpdate."""
+        return self.product_update_fields(product_id=product_id, title=title)
+
+    def product_update_fields(
+        self,
+        *,
+        product_id: str,
+        title: str | None = None,
+        product_type: str | None = None,
+        description_html: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Update product metadata fields via productUpdate."""
+        inp: dict[str, Any] = {"id": product_id}
+        if title is not None and str(title).strip():
+            inp["title"] = str(title).strip()
+        if product_type is not None and str(product_type).strip():
+            inp["productType"] = str(product_type).strip()
+        if description_html is not None:
+            inp["descriptionHtml"] = str(description_html)
+        if tags is not None:
+            cleaned = [str(t).strip() for t in tags if str(t).strip()]
+            if cleaned:
+                inp["tags"] = cleaned
+        if len(inp) <= 1:
+            return {"id": product_id, "title": "", "handle": ""}
+
         mutation = """
-        mutation ProductUpdateTitle($input: ProductInput!) {
+        mutation ProductUpdateFields($input: ProductInput!) {
           productUpdate(input: $input) {
-            product { id title handle }
+            product { id title handle productType }
             userErrors { field message }
           }
         }
         """
-        data = self.graphql(mutation, {"input": {"id": product_id, "title": title}})
+        data = self.graphql(mutation, {"input": inp})
         payload = data.get("productUpdate") or {}
         errs = payload.get("userErrors") or []
         if errs:
@@ -253,8 +279,9 @@ class ShopifyClient:
         prod = payload.get("product") or {}
         return {
             "id": str(prod.get("id") or product_id),
-            "title": str(prod.get("title") or title),
+            "title": str(prod.get("title") or title or ""),
             "handle": str(prod.get("handle") or ""),
+            "product_type": str(prod.get("productType") or product_type or ""),
         }
 
     def product_update_metafields(self, *, product_id: str, metafields: list[dict[str, str]]) -> None:
