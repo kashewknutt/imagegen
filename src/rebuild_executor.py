@@ -31,7 +31,7 @@ from src.xlsx_ingest import index_by_sku, iter_rows
 
 log = logging.getLogger(__name__)
 
-APPROVED_REVIEW_STATUSES = {"approved", "uploaded"}
+APPROVED_REVIEW_STATUSES = {"approved", "uploaded", "verified"}
 REPORT_SUBDIR = "rebuild_executor"
 
 

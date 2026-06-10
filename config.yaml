@@ -13,6 +13,7 @@ download_cache_dir: "outputs/_download_cache"
 
 # Outputs / progress
 outputs_dir: "outputs"
+outputsv2_dir: "outputsv2"
 state_path: "outputs/state.json"
 missing_images_report: "outputs/missing_local_images.csv"
 cost_log_csv: "outputs/cost_log.csv"

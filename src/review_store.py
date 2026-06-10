@@ -9,7 +9,7 @@ from typing import Any
 
 from .file_lock import file_lock
 
-REVIEW_STATUSES = {"pending_review", "approved", "uploaded", "failed"}
+REVIEW_STATUSES = {"pending_review", "approved", "uploaded", "verified", "failed"}
 UPLOAD_STATUSES = {"pending", "uploaded", "failed"}
 
 
@@ -157,6 +157,13 @@ class ReviewStore:
             patch["shopify_media_ids"] = shopify_media_ids
         return self.update(sku, **patch)
 
+    def mark_verified(self, sku: str) -> dict[str, Any]:
+        return self.update(
+            sku,
+            review_status="verified",
+            last_error="",
+        )
+
     def mark_failed(self, sku: str, error: str) -> dict[str, Any]:
         return self.update(
             sku,
@@ -190,6 +197,6 @@ class ReviewStore:
         for sku, rec in self.all_records().items():
             title = str(rec.get("title") or "").strip()
             status = str(rec.get("review_status") or "")
-            if title and status in {"approved", "uploaded"}:
+            if title and status in {"approved", "uploaded", "verified"}:
                 out[sku] = title
         return out

@@ -789,11 +789,18 @@ def _rebuild_stock_export(cfg) -> int:
     )
 
 
+def _mirror_outputs_v2(cfg, sku: str, reason: str, review_store: ReviewStore | None = None) -> None:
+    from src.outputsv2 import mirror_sku_from_config
+
+    mirror_sku_from_config(cfg, sku, reason=reason, review_store=review_store)
+
+
 def _review_status_badge(status: str) -> str:
     colors = {
         "pending_review": "🟡",
         "approved": "🟢",
         "uploaded": "✅",
+        "verified": "🔵",
         "failed": "🔴",
     }
     return f"{colors.get(status, '⚪')} `{status}`"
@@ -812,6 +819,8 @@ def _matches_review_filter(status: str, review_filter: str) -> bool:
         return status == "approved"
     if review_filter == "Uploaded":
         return status == "uploaded"
+    if review_filter == "Verified":
+        return status == "verified"
     if review_filter == "Failed":
         return status == "failed"
     return True
@@ -921,7 +930,67 @@ def _fetch_review_filtered_products(
     return collected, False
 
 
+def _local_review_products(
+    cfg,
+    review_store: ReviewStore,
+    *,
+    review_filter: str,
+    search: str = "",
+    product_type_filter: str = "",
+) -> list[dict]:
+    """Local workspace SKUs matching review_filter that are not linked to a Shopify product yet."""
+    if review_filter not in {"Pending review", "Failed", "Approved", "ALL"}:
+        return []
+
+    stock_by_sku: dict[str, dict] = {}
+    try:
+        rows = xlsx_index_by_sku(xlsx_iter_rows(cfg.xlsx_path, ["Total"]), sku_column="SKU")
+        stock_by_sku = {sku: row.values for sku, row in rows.items()}
+    except Exception:
+        pass
+
+    search_l = search.strip().lower()
+    type_l = product_type_filter.strip().lower()
+    products: list[dict] = []
+    for sku, rec in sorted(review_store.all_records().items()):
+        status = str(rec.get("review_status") or "pending_review")
+        if not _matches_review_filter(status, review_filter):
+            continue
+        if str(rec.get("product_id") or "").strip():
+            continue
+
+        idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=sku)
+        if not idx.workspace_dir.is_dir():
+            continue
+
+        stock_row = stock_by_sku.get(sku) or {}
+        category = str(rec.get("category") or stock_row.get("category") or "").strip()
+        title = str(rec.get("title") or stock_row.get("title") or sku).strip()
+        if search_l and search_l not in sku.lower() and search_l not in title.lower() and search_l not in category.lower():
+            continue
+        if type_l and type_l not in category.lower():
+            continue
+
+        products.append(
+            {
+                "id": "",
+                "title": title,
+                "handle": str(rec.get("handle") or ""),
+                "skus": [sku],
+                "sku": sku,
+                "media": [],
+                "status": "LOCAL",
+                "category": category,
+                "product_type": str(rec.get("product_type") or category),
+                "description_html": str(rec.get("description") or ""),
+                "local_only": True,
+            }
+        )
+    return products
+
+
 def _fetch_shopify_review_page(
+    cfg,
     client,
     review_store: ReviewStore,
     *,
@@ -930,8 +999,37 @@ def _fetch_shopify_review_page(
     page_idx: int,
     shopify_query: str | None,
     cursors: list,
+    search: str = "",
+    product_type_filter: str = "",
 ) -> tuple[list[dict], bool, list]:
     """Fetch one review page. Filtered modes return only matching products."""
+    if review_filter in {"Pending review", "Failed", "Approved"}:
+        local_all = _local_review_products(
+            cfg,
+            review_store,
+            review_filter=review_filter,
+            search=search,
+            product_type_filter=product_type_filter,
+        )
+        start = page_idx * page_size
+        end = start + page_size
+        local_page = local_all[start:end]
+        if local_page:
+            return local_page, end < len(local_all), cursors
+
+        shopify_page_idx = page_idx - (len(local_all) + page_size - 1) // page_size
+        if shopify_page_idx < 0:
+            shopify_page_idx = 0
+        products, has_next = _fetch_review_filtered_products(
+            client,
+            review_store,
+            review_filter=review_filter,
+            page_size=page_size,
+            page_idx=shopify_page_idx,
+            shopify_query=shopify_query,
+        )
+        return products, has_next, cursors
+
     if review_filter != "ALL":
         products, has_next = _fetch_review_filtered_products(
             client,
@@ -990,6 +1088,62 @@ def _bulk_approve_page_products(
         )
         approved_skus.append(primary_sku)
     return approved_skus
+
+
+def _bulk_verify_page_products(
+    cfg,
+    review_store: ReviewStore,
+    page_products: list[dict],
+) -> list[str]:
+    verified_skus: list[str] = []
+    for prod in page_products:
+        primary_sku = _primary_sku_from_product(prod)
+        if not primary_sku:
+            continue
+        status = _local_review_status(review_store, primary_sku)
+        if status not in {"uploaded", "verified"}:
+            continue
+        review_store.mark_verified(primary_sku)
+        refresh_manifest(
+            outputs_dir=cfg.outputs_dir,
+            sku=primary_sku,
+            patch={"review_status": "verified"},
+        )
+        try:
+            _mirror_outputs_v2(cfg, primary_sku, "bulk_verified", review_store=review_store)
+        except Exception:
+            pass
+        verified_skus.append(primary_sku)
+    return verified_skus
+
+
+def _render_bulk_verify_bar(
+    *,
+    cfg,
+    review_store: ReviewStore,
+    page_products: list[dict],
+    page_idx: int,
+    review_filter: str,
+    button_key: str,
+) -> None:
+    eligible = [
+        _primary_sku_from_product(prod)
+        for prod in page_products
+        if _primary_sku_from_product(prod)
+        and _local_review_status(review_store, _primary_sku_from_product(prod)) in {"uploaded", "verified"}
+    ]
+    bulk_col1, bulk_col2 = st.columns([1, 3])
+    with bulk_col1:
+        if st.button(
+            f"Bulk verify page ({len(eligible)})",
+            key=button_key,
+        ):
+            with st.spinner(f"Marking {len(eligible)} SKU(s) as verified..."):
+                verified_skus = _bulk_verify_page_products(cfg, review_store, page_products)
+            st.success(f"Bulk verified {len(verified_skus)} SKU(s): {', '.join(verified_skus)}")
+            st.rerun()
+    with bulk_col2:
+        st.caption("Marks uploaded SKUs on this page as the final verified state.")
 
 
 def _render_bulk_approve_bar(
@@ -1067,6 +1221,10 @@ def _approve_review_sku(
         sku=primary_sku,
         patch={"review_status": "approved"},
     )
+    try:
+        _mirror_outputs_v2(cfg, primary_sku, "approve", review_store=review_store)
+    except Exception:
+        pass
     return p1_ver, p2_ver
 
 
@@ -1124,11 +1282,13 @@ def _render_shopify_review(cfg) -> None:
     with f3:
         review_filter = st.selectbox(
             "Review status",
-            ["ALL", "Pending review", "Approved", "Uploaded", "Failed"],
+            ["ALL", "Pending review", "Approved", "Uploaded", "Verified", "Failed"],
             index=int(st.session_state.get("shopify_review_filter_idx", 1)),
             key="shopify_review_status_filter",
         )
-        st.session_state.shopify_review_filter_idx = ["ALL", "Pending review", "Approved", "Uploaded", "Failed"].index(review_filter)
+        st.session_state.shopify_review_filter_idx = [
+            "ALL", "Pending review", "Approved", "Uploaded", "Verified", "Failed"
+        ].index(review_filter)
     with f4:
         product_type_filter = st.text_input("Product type", value=st.session_state.get("shopify_review_product_type", ""))
         st.session_state.shopify_review_product_type = product_type_filter
@@ -1152,6 +1312,7 @@ def _render_shopify_review(cfg) -> None:
 
     try:
         page_products, has_next, cursors = _fetch_shopify_review_page(
+            cfg,
             client,
             review_store,
             review_filter=review_filter,
@@ -1159,6 +1320,8 @@ def _render_shopify_review(cfg) -> None:
             page_idx=page_idx,
             shopify_query=query,
             cursors=cursors,
+            search=search,
+            product_type_filter=product_type_filter,
         )
         st.session_state.shopify_review_cursors = cursors
     except Exception as e:
@@ -1186,8 +1349,23 @@ def _render_shopify_review(cfg) -> None:
             st.caption(f"Page {page_idx + 1} — {len(page_products)} `{review_filter}` product(s)")
 
     if not page_products:
+        local_count = len(
+            _local_review_products(
+                cfg,
+                review_store,
+                review_filter=review_filter,
+                search=search,
+                product_type_filter=product_type_filter,
+            )
+        )
         if review_filter == "ALL":
             st.info("No products found for the current filters.")
+        elif local_count and review_filter == "Pending review":
+            st.info(
+                f"No Shopify `{review_filter}` products on this page, but {local_count} local workspace "
+                "SKU(s) are pending review (migrated/corrected, not on Shopify yet). "
+                "Go to page 1 or clear search/filters."
+            )
         else:
             st.info(f"No `{review_filter}` products found. Try Previous/Next or change filters.")
         return
@@ -1200,6 +1378,14 @@ def _render_shopify_review(cfg) -> None:
         page_idx=page_idx,
         review_filter=review_filter,
         button_key=f"bulk_approve_top::{page_idx}::{review_filter}",
+    )
+    _render_bulk_verify_bar(
+        cfg=cfg,
+        review_store=review_store,
+        page_products=page_products,
+        page_idx=page_idx,
+        review_filter=review_filter,
+        button_key=f"bulk_verify_top::{page_idx}::{review_filter}",
     )
     st.divider()
 
@@ -1230,14 +1416,19 @@ def _render_shopify_review(cfg) -> None:
         with _bordered_container():
             header = st.columns([4, 1])
             with header[0]:
-                st.markdown(f"### {shop_title}")
+                display_title = shop_title or defaults["title"] or primary_sku
+                st.markdown(f"### {display_title}")
                 sku_text = ", ".join(skus) if skus else primary_sku
+                shopify_status = "local workspace only" if prod.get("local_only") else str(prod.get("status") or "")
                 st.caption(
-                    f"SKU: `{sku_text}` | Handle: `{handle}` | Shopify status: `{prod.get('status', '')}` | "
+                    f"SKU: `{sku_text}` | Handle: `{handle or '—'}` | Shopify status: `{shopify_status}` | "
                     f"Review: {_review_status_badge(review_status)}"
                 )
             with header[1]:
-                st.caption(f"{len(media)} Shopify media")
+                if prod.get("local_only"):
+                    st.caption("Not on Shopify yet")
+                else:
+                    st.caption(f"{len(media)} Shopify media")
 
             edit_title = st.text_input("Title", value=defaults["title"], key=f"title::{form_key}")
             edit_category = st.text_input("Category / product type", value=defaults["category"], key=f"cat::{form_key}")
@@ -1319,6 +1510,10 @@ def _render_shopify_review(cfg) -> None:
                                 prompt_override=prompt1_text,
                             )
                         refresh_manifest(outputs_dir=cfg.outputs_dir, sku=primary_sku)
+                        try:
+                            _mirror_outputs_v2(cfg, primary_sku, "regenerate_prompt1", review_store=review_store)
+                        except Exception:
+                            pass
                         st.success(f"Saved {out_path.name}")
                         st.rerun()
                     except Exception as e:
@@ -1341,6 +1536,10 @@ def _render_shopify_review(cfg) -> None:
                             )
                         refresh_manifest(outputs_dir=cfg.outputs_dir, sku=primary_sku)
                         try:
+                            _mirror_outputs_v2(cfg, primary_sku, "regenerate_prompt2", review_store=review_store)
+                        except Exception:
+                            pass
+                        try:
                             _rebuild_stock_export(cfg)
                         except Exception as e:
                             st.warning(f"XLSX rebuild failed: {e}")
@@ -1352,7 +1551,7 @@ def _render_shopify_review(cfg) -> None:
 
             p1_ver, p2_ver = _latest_prompt_versions(cfg, primary_sku)
 
-            action_cols = st.columns(3)
+            action_cols = st.columns(4)
             with action_cols[0]:
                 if st.button("Approve", key=f"approve::{form_key}", type="primary"):
                     _approve_review_sku(
@@ -1375,7 +1574,6 @@ def _render_shopify_review(cfg) -> None:
                     st.success(f"Approved {primary_sku} (prompt1 v{p1_ver}, prompt2 v{p2_ver}).")
                     st.rerun()
             with action_cols[1]:
-                upload_disabled = review_status not in {"approved", "uploaded", "failed"} and not edit_title
                 if st.button("Upload / Update Shopify", key=f"upload::{form_key}", disabled=not product_id):
                     try:
                         tags_list = [t.strip() for t in edit_tags.split(",") if t.strip()]
@@ -1398,6 +1596,10 @@ def _render_shopify_review(cfg) -> None:
                             primary_sku,
                             shopify_media_ids=result.get("media_ids") or [],
                         )
+                        try:
+                            _mirror_outputs_v2(cfg, primary_sku, "shopify_upload", review_store=review_store)
+                        except Exception:
+                            pass
                         title_store.update(
                             primary_sku,
                             sku=primary_sku,
@@ -1415,6 +1617,24 @@ def _render_shopify_review(cfg) -> None:
                         st.error("Upload failed.")
                         st.exception(e)
             with action_cols[2]:
+                if st.button(
+                    "Mark verified",
+                    key=f"verify::{form_key}",
+                    disabled=review_status not in {"uploaded", "verified"},
+                ):
+                    review_store.mark_verified(primary_sku)
+                    refresh_manifest(
+                        outputs_dir=cfg.outputs_dir,
+                        sku=primary_sku,
+                        patch={"review_status": "verified"},
+                    )
+                    try:
+                        _mirror_outputs_v2(cfg, primary_sku, "verified", review_store=review_store)
+                    except Exception:
+                        pass
+                    st.success(f"Marked {primary_sku} as verified.")
+                    st.rerun()
+            with action_cols[3]:
                 expected = images_for_sku(cfg, primary_sku, review_store=review_store)
                 paths = media_paths_for_sku(cfg, primary_sku, review_store=review_store)
                 st.caption(
@@ -1432,6 +1652,14 @@ def _render_shopify_review(cfg) -> None:
         page_idx=page_idx,
         review_filter=review_filter,
         button_key=f"bulk_approve_bottom::{page_idx}::{review_filter}",
+    )
+    _render_bulk_verify_bar(
+        cfg=cfg,
+        review_store=review_store,
+        page_products=page_products,
+        page_idx=page_idx,
+        review_filter=review_filter,
+        button_key=f"bulk_verify_bottom::{page_idx}::{review_filter}",
     )
 
 
@@ -2249,10 +2477,14 @@ def _render_upload(cfg) -> None:
         collection_tags.append("bestseller")
     st.caption("Note: publishing to sales channels is not wired yet; products will be created as unpublished by default.")
 
+    sd = str(st.session_state.get("shopify_domain") or "").strip()
+    api_ver = str(st.session_state.get("shopify_api_version") or "2024-01").strip() or "2024-01"
+    tok = str(st.session_state.get("shopify_token") or "").strip()
+    client_id = str(st.session_state.get("shopify_client_id") or "").strip()
     cache_path = cfg.outputs_dir / ".shopify_token_cache.json"
-    cache_key = f"{sd}|{st.session_state.get('shopify_client_id','')}"
-    cached = load_cached_token(cache_path, cache_key) if (sd and st.session_state.get("shopify_client_id")) else None
-    token_to_use = tok.strip() if tok.strip() else (cached.access_token if cached else "")
+    cache_key = f"{sd}|{client_id}"
+    cached = load_cached_token(cache_path, cache_key) if (sd and client_id) else None
+    token_to_use = tok if tok else (cached.access_token if cached else "")
 
     # --- Shopify taxonomy Category (UI + persisted choice) ---
     classify_key = f"shopify_type_classified::{sku_to_open}"

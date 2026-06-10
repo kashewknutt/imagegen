@@ -279,4 +279,15 @@ def update_shopify_product_from_review(
             "review_status": "uploaded",
         },
     )
+    try:
+        from src.outputsv2 import mirror_sku_from_config
+
+        mirror_sku_from_config(
+            cfg,
+            sku,
+            reason="shopify_upload",
+            review_store=review_store,
+        )
+    except Exception:
+        pass
     return result

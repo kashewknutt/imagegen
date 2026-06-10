@@ -1,5 +1,6 @@
 .env
 outputs/
+outputsv2/
 pics_raw/
 __pycache__/
 .streamlit/

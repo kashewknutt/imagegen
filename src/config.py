@@ -18,6 +18,7 @@ class AppConfig:
     allow_url_fallback: bool
     download_cache_dir: Path
     outputs_dir: Path
+    outputsv2_dir: Path
     state_path: Path
     missing_images_report: Path
     cost_log_csv: Path
@@ -64,6 +65,7 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
         allow_url_fallback=bool(get("allow_url_fallback", True)),
         download_cache_dir=_p(str(get("download_cache_dir", "outputs/_download_cache"))),
         outputs_dir=_p(str(get("outputs_dir", "outputs"))),
+        outputsv2_dir=_p(str(get("outputsv2_dir", "outputsv2"))),
         state_path=_p(str(get("state_path", "outputs/state.json"))),
         missing_images_report=_p(str(get("missing_images_report", "outputs/missing_local_images.csv"))),
         cost_log_csv=_p(str(get("cost_log_csv", "outputs/cost_log.csv"))),

@@ -217,6 +217,12 @@ def approve_many(
         results[key] = (final_p1, final_p2)
 
     store.update(key, status="approved", approved_version=version)
+    try:
+        from src.outputsv2 import mirror_sku_from_config
+
+        mirror_sku_from_config(cfg, key, reason="approve_many")
+    except Exception:
+        pass
     return results
 
 
@@ -332,4 +338,10 @@ def generate_to_workspace(
     meta["workspace_version"] = next_v
     meta["workspace_path"] = str(final_path)
     refresh_manifest(outputs_dir=cfg.outputs_dir, sku=work.key)
+    try:
+        from src.outputsv2 import mirror_sku_from_config
+
+        mirror_sku_from_config(cfg, work.key, reason=f"regenerate_{prompt_slot}")
+    except Exception:
+        pass
     return final_path, meta
