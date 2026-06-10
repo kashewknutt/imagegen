@@ -1,0 +1,17 @@
+# Drive-backed review app configuration
+drive_outputs_folder_id: "1MHbmR8ruqc9P0K3wExA89FOIUTE-CRXB"
+drive_xlsx_file_id: "1TGAQxp446FbA-nPCeOgRmYiXiMjv_ywX"
+
+# Local workspace source of truth (read from here; push changes to Drive only)
+local_outputs_dir: "outputs"
+
+# Drive API metadata maps only (no bulk file cache)
+drive_cache_dir: "drive_review/cache"
+drive_credentials_dir: "drive_review/credentials"
+
+# Firestore remote leasing (set project id from: gcloud config get-value project)
+firestore_project_id: "valneetrivial"
+firestore_collection: "drive_review_leases"
+lease_ttl_seconds: 600
+max_parallel_leases: 40
+machine_id: "local"

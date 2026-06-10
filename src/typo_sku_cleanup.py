@@ -35,7 +35,16 @@ KNOWN_TYPO_TO_REAL: dict[str, str] = {
     "DIAESTW2037": "DIAESTW26037",
     "DIAFHW26008": "DIANFHW26008",
     "DIPFHW26019": "DIANFHW26019",
+    # DAIJE used DIAESTR prefix; Stock uses DIAESTW for same numeric suffix.
+    "DIAESTR26083": "DIAESTW26083",
+    "DIAESTR26085": "DIAESTW26085",
+    "DIAESTR26087": "DIAESTW26087",
+    "DIAESTR26089": "DIAESTW26089",
+    # Legacy 1.csv SKU; real product is adjacent Stock row with prompts.
+    "DIARBNR26015": "DIARBNR26014",
 }
+
+_DIAESTR_PREFIX_RE = re.compile(r"^DIAESTR(\d+)$", re.IGNORECASE)
 
 SKIP_OUTPUT_DIRS = {
     "_download_cache",
@@ -97,6 +106,12 @@ def suggest_real_sku(typo_sku: str, stock_skus: set[str]) -> str | None:
     if typo_sku in KNOWN_TYPO_TO_REAL:
         real = KNOWN_TYPO_TO_REAL[typo_sku]
         return real if real in stock_skus else None
+
+    m = _DIAESTR_PREFIX_RE.match(typo_sku)
+    if m:
+        candidate = f"DIAESTW{m.group(1)}"
+        if candidate in stock_skus:
+            return candidate
 
     # High-confidence fuzzy fallback: same length, single-character edit, unique match.
     typo_u = typo_sku.upper()
@@ -160,15 +175,29 @@ def audit_typo_folders(
             evidence["typo_review_status"] = str(rec.get("review_status") or "")
 
         if not real_sku:
-            entries.append(
-                TypoAuditEntry(
-                    typo_sku=folder_sku,
-                    action="unresolved",
-                    real_sku=None,
-                    evidence=evidence,
-                    notes="No confident real Stock SKU mapping.",
+            has_prompts = evidence["typo_has_prompt1"] or evidence["typo_has_prompt2"]
+            review_status = str(evidence.get("typo_review_status") or "")
+            uploaded_like = review_status in {"uploaded", "verified", "approved"}
+            if not has_prompts and not uploaded_like:
+                entries.append(
+                    TypoAuditEntry(
+                        typo_sku=folder_sku,
+                        action="delete_orphan",
+                        real_sku=None,
+                        evidence=evidence,
+                        notes="Not in Stock.xlsx, no mapping, no generated prompts — safe orphan cleanup.",
+                    )
                 )
-            )
+            else:
+                entries.append(
+                    TypoAuditEntry(
+                        typo_sku=folder_sku,
+                        action="unresolved",
+                        real_sku=None,
+                        evidence=evidence,
+                        notes="No confident real Stock SKU mapping.",
+                    )
+                )
             continue
 
         evidence["real_sku_in_stock"] = real_sku in stock_skus
@@ -206,6 +235,7 @@ def audit_typo_folders(
 
     summary = {
         "delete_safe": sum(1 for e in entries if e.action == "delete_safe"),
+        "delete_orphan": sum(1 for e in entries if e.action == "delete_orphan"),
         "migrate": sum(1 for e in entries if e.action == "migrate"),
         "unresolved": sum(1 for e in entries if e.action == "unresolved"),
     }
@@ -231,6 +261,7 @@ def write_audit_report(audit: dict[str, Any], outputs_dir: Path) -> tuple[Path, 
         "## Summary",
         "",
         f"- delete_safe: {audit.get('summary', {}).get('delete_safe', 0)}",
+        f"- delete_orphan: {audit.get('summary', {}).get('delete_orphan', 0)}",
         f"- migrate: {audit.get('summary', {}).get('migrate', 0)}",
         f"- unresolved: {audit.get('summary', {}).get('unresolved', 0)}",
         "",
@@ -313,6 +344,33 @@ def _migrate_raw_and_videos(
                 shutil.copy2(src, dest)
             result["videos_moved"].append(dest.name)
 
+    return result
+
+
+def delete_orphan_folder(
+    *,
+    outputs_dir: Path,
+    typo_sku: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    typo_dir = outputs_dir / typo_sku
+    result: dict[str, Any] = {
+        "typo_sku": typo_sku,
+        "action": "delete_orphan",
+        "dry_run": dry_run,
+        "deleted": False,
+        "timestamp_utc": _now_utc(),
+    }
+    if not typo_dir.is_dir():
+        result["skipped"] = True
+        result["reason"] = "folder missing"
+        return result
+    if dry_run:
+        result["would_delete"] = str(typo_dir)
+        return result
+    shutil.rmtree(typo_dir)
+    result["deleted"] = True
+    result["deleted_path"] = str(typo_dir)
     return result
 
 
@@ -431,6 +489,7 @@ def apply_typo_cleanup(
         "dry_run": dry_run,
         "applied_at_utc": _now_utc(),
         "deletions": [],
+        "orphan_deletions": [],
         "migrations": [],
         "skipped": [],
     }
@@ -439,7 +498,15 @@ def apply_typo_cleanup(
         action = str(entry.get("action") or "")
         typo_sku = str(entry.get("typo_sku") or "")
         real_sku = str(entry.get("real_sku") or "")
-        if action == "delete_safe" and real_sku:
+        if action == "delete_orphan":
+            results["orphan_deletions"].append(
+                delete_orphan_folder(
+                    outputs_dir=outputs_dir,
+                    typo_sku=typo_sku,
+                    dry_run=dry_run,
+                )
+            )
+        elif action == "delete_safe" and real_sku:
             results["deletions"].append(
                 delete_typo_folder(
                     outputs_dir=outputs_dir,

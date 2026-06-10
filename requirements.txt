@@ -9,3 +9,4 @@ openpyxl>=3.1
 tenacity>=8.2
 google-api-python-client>=2.120
 google-auth-oauthlib>=1.2
+google-cloud-firestore>=2.16

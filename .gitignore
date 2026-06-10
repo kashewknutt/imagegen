@@ -1,6 +1,8 @@
 .env
 outputs/
 outputsv2/
+drive_review/cache/
+drive_review/credentials/
 pics_raw/
 __pycache__/
 .streamlit/
