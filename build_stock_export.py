@@ -173,12 +173,16 @@ def build_export(
 
     stock_columns = list(stock_rows[0].values.keys())
     extra_columns = [
-        "productName",
-        "thumbnailImage",
-        "thumbnail image path",
-        "thumbnailImageName",
-        "productDescription",
-        "hashtag/keyword",
+        c
+        for c in [
+            "productName",
+            "thumbnailImage",
+            "thumbnail image path",
+            "thumbnailImageName",
+            "productDescription",
+            "hashtag/keyword",
+        ]
+        if c not in stock_columns
     ]
     headers = stock_columns + extra_columns
 

@@ -27,11 +27,10 @@ from src.drive_client import (
 )
 from src.drive_outputs_sync import DriveOutputsSync
 from src.drive_review_config import DriveReviewConfig, load_drive_review_config
-from src.drive_stock_sync import rebuild_and_replace, resolve_stock_path
+from src.drive_stock_sync import rebuild_and_replace, refresh_stock_sheet, resolve_stock_path
 from src.drive_sync_orchestrator import (
-    sync_after_approve,
     sync_after_regenerate,
-    sync_after_shopify_upload,
+    sync_save_everything,
     validate_local_workspace,
 )
 from src.drive_review_log import setup_drive_review_logging
@@ -112,6 +111,7 @@ def _title_store(cfg: DriveReviewConfig) -> TitleStore:
 
 def _ensure_review_autofill(
     cfg: DriveReviewConfig,
+    service,
     *,
     sku: str,
     review_store: ReviewStore,
@@ -132,10 +132,7 @@ def _ensure_review_autofill(
     if not needs_category and not needs_title:
         st.session_state[key] = {"skipped": True}
         return
-    try:
-        stock_path = resolve_stock_path(cfg)
-    except FileNotFoundError:
-        stock_path = cfg.local_stock_path
+    stock_path = resolve_stock_path(cfg, service)
     with st.spinner("Auto-filling title and category..."):
         result = autofill_review_record(
             cfg,
@@ -221,7 +218,7 @@ def _drive_sidebar(cfg: DriveReviewConfig):
                 )
     st.caption(f"OAuth callback port: `{DRIVE_OAUTH_PORT}` (override with env `DRIVE_OAUTH_PORT`)")
     st.caption(f"Outputs folder: `{cfg.drive_outputs_folder_id}`")
-    st.caption(f"XLSX file: `{cfg.drive_xlsx_file_id}`")
+    st.caption(f"Stock sheet: `{cfg.stock_spreadsheet_id}`")
 
 
 def _list_candidates(images_dir: Path, sku: str) -> list[Path]:
@@ -283,7 +280,7 @@ def _progress_callback(progress_bar, status_text):
 def _render_cleanup(cfg: DriveReviewConfig, sync: DriveOutputsSync, service) -> None:
     st.subheader("Typo Cleanup (Drive)")
     st.caption(
-        f"Reads local `{cfg.outputs_dir}` and `{cfg.local_stock_path.name}` — no bulk Drive downloads. "
+        f"Reads local `{cfg.outputs_dir}` and stock from Google Sheet `{cfg.stock_spreadsheet_id}`. "
         "**Apply** migrates locally, then pushes only changed SKUs + XLSX to Drive."
     )
     col1, col2, col3 = st.columns(3)
@@ -352,7 +349,7 @@ def _render_review_sku(
 
     media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=sku)
     shop_prod = _shopify_product_for_sku(shopify_client, sku) if shopify_client else None
-    _ensure_review_autofill(cfg, sku=sku, review_store=review_store, media_idx=media_idx, shop_prod=shop_prod)
+    _ensure_review_autofill(cfg, service, sku=sku, review_store=review_store, media_idx=media_idx, shop_prod=shop_prod)
 
     rec = review_store.get_record(sku)
     title_store = _title_store(cfg)
@@ -409,7 +406,8 @@ def _render_review_sku(
         ref_path = refs[0] if refs else None
 
     gen = _ensure_genai(cfg)
-    g1, g2, g3, g4 = st.columns(4)
+    has_both_prompts = bool(media_idx.prompt1_versions and media_idx.prompt2_versions)
+    g1, g2 = st.columns(2)
     with g1:
         if st.button("Regenerate prompt1", disabled=ref_path is None, key=f"rp1::{sku}"):
             work = prepare_work_item_for_path(cfg.base, sku, ref_path)
@@ -432,44 +430,68 @@ def _render_review_sku(
             st.success(f"Saved {out_path.name}")
             st.json(result)
             st.rerun()
-    with g3:
-        if st.button("Approve", type="primary", key=f"approve::{sku}"):
-            p1 = media_idx.prompt1_versions[-1][0] if media_idx.prompt1_versions else None
-            p2 = media_idx.prompt2_versions[-1][0] if media_idx.prompt2_versions else None
-            review_store.approve(
-                sku,
+
+    save_help = (
+        "Saves title/category/description/tags; uploads latest prompt1+prompt2 to Drive + Sheet. "
+        "Skips raw/video on Drive if already there. Shopify gets generated images only."
+    )
+    if shopify_client and product_id:
+        save_help += " Replaces Shopify product images with latest prompt1+prompt2."
+    elif shopify_client:
+        save_help += " (Shopify skipped — no product linked yet)"
+    if st.button(
+        "Save everything",
+        type="primary",
+        disabled=not has_both_prompts,
+        key=f"save_all::{sku}",
+        help=save_help,
+    ):
+        with st.spinner("Saving to Drive, Google Sheet, and Shopify..."):
+            result = sync_save_everything(
+                cfg,
+                sync,
+                service,
+                sku=sku,
                 title=title,
                 category=category,
-                product_type=category,
                 description=description,
                 tags=tags,
-                prompt1_version=p1,
-                prompt2_version=p2,
+                prompt1_text=prompt1_text,
+                prompt2_text=prompt2_text,
                 product_id=product_id,
                 handle=str(rec.get("handle") or (shop_prod or {}).get("handle") or ""),
-            )
-            review_store.update(sku, prompt1_text=prompt1_text, prompt2_text=prompt2_text)
-            result = sync_after_approve(cfg, sync, service, sku, review_store=review_store)
-            st.success("Approved and synced.")
-            st.json(result)
-            st.rerun()
-    with g4:
-        if st.button("Upload / Update Shopify", disabled=not (shopify_client and product_id), key=f"upload::{sku}"):
-            tags_list = [t.strip() for t in tags.split(",") if t.strip()]
-            result = sync_after_shopify_upload(
-                cfg, sync, service,
-                sku=sku,
                 shopify_client=shopify_client,
-                product_id=product_id,
-                title=title,
-                product_type=category,
-                description_html=description.replace("\n", "<br>") if description else "",
-                tags=tags_list or None,
+                shop_prod=shop_prod,
                 review_store=review_store,
             )
-            st.success("Shopify + Drive + XLSX synced.")
-            st.json(result)
-            st.rerun()
+        media_check = (result.drive_push or {}).get("media_check") or {}
+        skipped = (result.drive_push or {}).get("skipped_existing_raw_videos") or []
+        if media_check:
+            st.caption(
+                f"Drive check — videos: {len(media_check.get('videos_on_drive') or [])}/"
+                f"{len(media_check.get('local_videos') or [])} on Drive, "
+                f"raw: {len(media_check.get('raw_on_drive') or [])}/"
+                f"{len(media_check.get('local_raw') or [])} on Drive"
+                + (f" (skipped {len(skipped)} upload(s))" if skipped else "")
+            )
+        if result.errors:
+            st.warning("Saved with warnings:")
+            for err in result.errors:
+                st.caption(f"• {err}")
+        else:
+            st.success("Saved everything — Drive, Google Sheet" + (", and Shopify" if result.shopify else "."))
+        st.json(
+            {
+                "drive_push": result.drive_push,
+                "review_state_pushed": result.review_state_pushed,
+                "xlsx_replaced": result.xlsx_replaced,
+                "shopify": result.shopify,
+                "errors": result.errors,
+            }
+        )
+        st.rerun()
+    if not has_both_prompts:
+        st.caption("Generate both prompt1 and prompt2 before Save everything.")
 
     v1, v2, v3 = st.columns(3)
     with v1:
@@ -501,8 +523,8 @@ def _render_review_queue(cfg: DriveReviewConfig, sync: DriveOutputsSync, service
     review_store = _review_store(cfg)
     sync.sync_review_state_local()
     try:
-        resolve_stock_path(cfg)
-    except FileNotFoundError as e:
+        resolve_stock_path(cfg, service)
+    except (FileNotFoundError, RuntimeError) as e:
         st.error(str(e))
         return
 
@@ -564,7 +586,8 @@ def main() -> None:
     st.set_page_config(page_title="Drive Review", layout="wide")
     st.title("Drive-Backed SKU Review")
     st.caption(
-        f"Local workspace: `{cfg.outputs_dir}` | Push uploads to Drive + Shopify + Drive XLSX (no bulk downloads)."
+        f"Local workspace: `{cfg.outputs_dir}` | Stock: Google Sheet `{cfg.stock_spreadsheet_id}` "
+        f"| Push SKU folders + sheet updates on Shopify/Drive sync only."
     )
 
     cfg.outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -589,6 +612,7 @@ def main() -> None:
     try:
         service = _drive_service(cfg, write=True)
         sync = DriveOutputsSync(cfg, service)
+        refresh_stock_sheet(cfg, service)
     except Exception as e:
         st.error("Connect Google Drive first.")
         st.exception(e)
@@ -601,7 +625,16 @@ def main() -> None:
         _render_review_queue(cfg, sync, service, shopify_client, leases)
     with tab_tools:
         st.subheader("Tools")
-        st.caption(f"Stock source: `{cfg.local_stock_path}` | Outputs: `{cfg.outputs_dir}`")
+        st.caption(
+            f"Stock sheet: [Google Sheets](https://docs.google.com/spreadsheets/d/{cfg.stock_spreadsheet_id}/edit) "
+            f"(cached at `{cfg.local_stock_path}`) | Outputs: `{cfg.outputs_dir}`"
+        )
+        if st.button("Refresh stock sheet from Drive"):
+            try:
+                path = refresh_stock_sheet(cfg, service, force=True)
+                st.success(f"Refreshed stock cache: `{path}`")
+            except Exception as e:
+                st.error(str(e))
         if st.button("Tally everything", type="primary"):
             progress = st.progress(0, text="Starting tally...")
             status = st.empty()

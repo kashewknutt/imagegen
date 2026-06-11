@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from src.image_resolve import find_local_image
-from src.media_workspace import MediaSkuIndex
+from src.media_workspace import SkuMediaIndex
 from src.review_store import ReviewStore
 from src.title_generator import generate_title_from_image
 from src.title_prompts import normalize_product_category
@@ -24,7 +24,7 @@ def title_image_for_sku(
     outputs_dir: Path,
     images_dir: Path,
     sku: str,
-    media_idx: MediaSkuIndex | None = None,
+    media_idx: SkuMediaIndex | None = None,
 ) -> Path | None:
     """Same image priority as generate_missing_titles / review: prompt2, prompt1, raw, DAIJE."""
     if media_idx is not None:
@@ -70,7 +70,7 @@ def autofill_review_record(
     *,
     sku: str,
     review_store: ReviewStore,
-    media_idx: MediaSkuIndex | None = None,
+    media_idx: SkuMediaIndex | None = None,
     shop_prod: dict | None = None,
     title_store: TitleStore | None = None,
     stock_path: Path | None = None,
@@ -98,7 +98,7 @@ def autofill_review_record(
         if category:
             updates["category"] = category
             updates["product_type"] = category
-            messages.append("category from Stock.xlsx")
+            messages.append("category from stock sheet")
 
     title = _title_from_stores(
         sku=sku,

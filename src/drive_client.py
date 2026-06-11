@@ -181,16 +181,42 @@ def list_videos_for_sku(*, service, folder_id: str, sku: str, page_size: int = 5
     return [x for x in out if x.id]
 
 
+GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def get_file_metadata(*, service, file_id: str) -> dict[str, Any]:
+    return (
+        service.files()
+        .get(
+            fileId=file_id,
+            fields="id,name,mimeType,size,modifiedTime",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+
 def download_file_to_cache(*, service, file_id: str, cache_path: Path) -> Path:
     """
     Downloads a Drive file to cache_path if missing. Returns cache_path.
     """
     if cache_path.exists() and cache_path.stat().st_size > 0:
         return cache_path
+    return export_drive_file_to_cache(service=service, file_id=file_id, cache_path=cache_path)
+
+
+def export_drive_file_to_cache(*, service, file_id: str, cache_path: Path) -> Path:
+    """Download a Drive file or export a Google Sheet as XLSX into cache_path."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     from googleapiclient.http import MediaIoBaseDownload
 
-    req = service.files().get_media(fileId=file_id)
+    meta = get_file_metadata(service=service, file_id=file_id)
+    mime = str(meta.get("mimeType") or "")
+    if mime == GOOGLE_SHEET_MIME:
+        req = service.files().export_media(fileId=file_id, mimeType=XLSX_MIME)
+    else:
+        req = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, req)
     done = False

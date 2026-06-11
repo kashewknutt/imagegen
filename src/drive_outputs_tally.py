@@ -77,7 +77,7 @@ def tally_drive_vs_local(
     """Metadata-only Drive scan + local filesystem checks (no downloads)."""
     log = get_logger()
     t0 = time.monotonic()
-    stock_path = resolve_stock_path(cfg)
+    stock_path = resolve_stock_path(cfg, sync.service)
     stock_skus = load_stock_skus(stock_path)
     enriched_skus = _enriched_skus(cfg.enriched_xlsx_path)
     review_store = ReviewStore(cfg.review_state_path)
@@ -200,6 +200,7 @@ def tally_drive_vs_local(
         "stock_path": str(stock_path),
         "local_outputs_dir": str(cfg.outputs_dir),
         "drive_outputs_folder_id": cfg.drive_outputs_folder_id,
+        "stock_spreadsheet_id": cfg.stock_spreadsheet_id,
         "summary": summary,
         "local_only": local_only,
         "drive_only": drive_only,

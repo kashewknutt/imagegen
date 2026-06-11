@@ -1,5 +1,6 @@
 # Drive-backed review app configuration
 drive_outputs_folder_id: "1MHbmR8ruqc9P0K3wExA89FOIUTE-CRXB"
+# Canonical stock Google Sheet (read on load; written back on Shopify/Drive sync only)
 drive_xlsx_file_id: "1TGAQxp446FbA-nPCeOgRmYiXiMjv_ywX"
 
 # Local workspace source of truth (read from here; push changes to Drive only)

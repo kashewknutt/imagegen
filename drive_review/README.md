@@ -2,8 +2,8 @@
 
 Standalone Streamlit app for reviewing SKU workspaces with **local-first** reads and **push-only** Drive sync.
 
-- **Reads** from repo `outputs/` and local `Stock.xlsx` (same content as the Drive outputs folder).
-- **Writes** to Drive (SKU folders, `review_state.json`, enriched XLSX), Shopify, and Firestore leases — no bulk downloads.
+- **Reads** SKU workspaces from local `outputs/` and stock rows from the [Google Sheet](https://docs.google.com/spreadsheets/d/1TGAQxp446FbA-nPCeOgRmYiXiMjv_ywX/edit) (`drive_xlsx_file_id`).
+- **Writes** the sheet back only when you approve/upload/sync to Shopify and Drive — not on every read.
 
 ## Prerequisites
 
@@ -76,7 +76,7 @@ Set `firestore_project_id` in `drive_review/config.yaml` if the setup script did
 
 ## Local workspace
 
-Ensure `outputs/` contains your SKU folders (and `outputs/review_state.json` if you use review state). Point `local_outputs_dir` in `drive_review/config.yaml` at that directory (default: `outputs`). Stock data comes from `Stock.xlsx` in the repo root via `config.yaml` `xlsx_path`.
+Ensure `outputs/` contains your SKU folders (and `outputs/review_state.json` if you use review state). Point `local_outputs_dir` in `drive_review/config.yaml` at that directory (default: `outputs`). Stock data is exported from the Google Sheet on Drive (`drive_xlsx_file_id`) into `drive_review/cache/stock_sheet.xlsx` when the app connects (refreshed when Drive `modifiedTime` changes).
 
 ## Workflow
 

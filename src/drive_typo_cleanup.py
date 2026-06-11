@@ -31,14 +31,14 @@ def audit_drive_typo_folders(
     *,
     progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Audit using local outputs/ and Stock.xlsx — no Drive downloads."""
+    """Audit using local outputs/ and cached Google Sheet export."""
     log = get_logger()
     t0 = time.monotonic()
     log.info("Auditing typo folders from local %s ...", cfg.outputs_dir)
-    resolve_stock_path(cfg)
+    stock_path = resolve_stock_path(cfg, service)
     audit = audit_typo_folders(
         outputs_dir=cfg.outputs_dir,
-        xlsx_path=cfg.local_stock_path,
+        xlsx_path=stock_path,
         review_store_path=cfg.review_state_path if cfg.review_state_path.is_file() else None,
     )
     audit["scan_mode"] = "local_outputs"
@@ -63,7 +63,7 @@ def apply_drive_typo_cleanup(
     progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     log = get_logger()
-    resolve_stock_path(cfg)
+    stock_path = resolve_stock_path(cfg, service)
 
     if dry_run:
         log.info("Dry-run: local audit only (no changes).")
@@ -78,7 +78,7 @@ def apply_drive_typo_cleanup(
     results = apply_typo_cleanup(
         outputs_dir=cfg.outputs_dir,
         outputsv2_dir=cfg.base.outputsv2_dir,
-        xlsx_path=cfg.local_stock_path,
+        xlsx_path=stock_path,
         review_store_path=cfg.review_state_path,
         dry_run=False,
     )

@@ -36,8 +36,14 @@ class DriveReviewConfig:
         return self.outputs_dir / "review_state.json"
 
     @property
+    def stock_spreadsheet_id(self) -> str:
+        """Google Sheets / Drive spreadsheet ID for canonical stock entries."""
+        return self.drive_xlsx_file_id
+
+    @property
     def local_stock_path(self) -> Path:
-        return self.base.xlsx_path
+        """Cached export of the Drive stock sheet (not repo Stock.xlsx)."""
+        return self.drive_cache_dir / "stock_sheet.xlsx"
 
     @property
     def enriched_xlsx_path(self) -> Path:

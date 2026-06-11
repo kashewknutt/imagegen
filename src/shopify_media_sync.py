@@ -106,9 +106,15 @@ def media_paths_for_sku(
     }
 
 
-def images_for_sku(cfg, sku: str, *, review_store: "ReviewStore | None" = None) -> list[tuple[Path, str]]:
+def images_for_sku(
+    cfg,
+    sku: str,
+    *,
+    review_store: "ReviewStore | None" = None,
+    generated_only: bool = False,
+) -> list[tuple[Path, str]]:
     """
-    Shopify image upload order: prompt2 (thumbnail), prompt1, then all raw references.
+    Shopify image upload order: prompt2 (thumbnail), prompt1, then raw references (unless generated_only).
     """
     paths = media_paths_for_sku(cfg, sku, review_store=review_store)
     sku = (sku or "").strip()
@@ -126,8 +132,9 @@ def images_for_sku(cfg, sku: str, *, review_store: "ReviewStore | None" = None) 
 
     add(paths["prompt2"], f"{sku} - Product")
     add(paths["prompt1"], f"{sku} - Lifestyle")
-    for i, p in enumerate(paths["raw"], start=1):
-        add(p, f"{sku} - Reference {p.name}" if len(paths["raw"]) > 1 else f"{sku} - Reference")
+    if not generated_only:
+        for i, p in enumerate(paths["raw"], start=1):
+            add(p, f"{sku} - Reference {p.name}" if len(paths["raw"]) > 1 else f"{sku} - Reference")
 
     return out
 
@@ -248,8 +255,9 @@ def update_shopify_product_from_review(
     review_store: "ReviewStore | None" = None,
     existing_media_ids: list[str] | None = None,
     replace_media: bool = True,
+    generated_only: bool = False,
 ) -> dict[str, Any]:
-    """Update product fields and sync full local media set to Shopify."""
+    """Update product fields and sync local media set to Shopify."""
     if title or product_type or description_html or tags:
         client.product_update_fields(
             product_id=product_id,
@@ -259,14 +267,14 @@ def update_shopify_product_from_review(
             tags=tags,
         )
 
-    images = images_for_sku(cfg, sku, review_store=review_store)
+    images = images_for_sku(cfg, sku, review_store=review_store, generated_only=generated_only)
     paths = media_paths_for_sku(cfg, sku, review_store=review_store)
     result = sync_product_media(
         client,
         product_id=product_id,
         sku=sku,
         images=images,
-        videos=paths["videos"],
+        videos=[] if generated_only else paths["videos"],
         replace_existing=replace_media,
         existing_media_ids=existing_media_ids,
     )
