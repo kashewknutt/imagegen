@@ -16,6 +16,7 @@ from src.genai_client import GenAiImageClient
 from src.pipeline import (
     PROMPT_1,
     PROMPT_2,
+    default_prompt_for_category,
     generate_pair,
     generate_single_replacement,
     generate_to_workspace,
@@ -854,8 +855,8 @@ def _review_field_defaults(
         "category": product_type or category,
         "description": str(rec.get("description") or _strip_html(description_html, max_len=8000)),
         "tags": str(rec.get("tags") or ""),
-        "prompt1_text": str(rec.get("prompt1_text") or PROMPT_1),
-        "prompt2_text": str(rec.get("prompt2_text") or PROMPT_2),
+        "prompt1_text": str(rec.get("prompt1_text") or default_prompt_for_category(PROMPT_1, product_type or category)),
+        "prompt2_text": str(rec.get("prompt2_text") or default_prompt_for_category(PROMPT_2, product_type or category)),
     }
 
 

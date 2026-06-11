@@ -28,6 +28,41 @@ PROMPT_1 = """Create a realistic luxury model try-on image (body part only ) usi
 
 PROMPT_2 = """Create a realistic premium jewellery product photograph using the uploaded jewellery image as the exact reference. The jewellery design, proportions, craftsmanship, chain structure, stones, metal texture, and detailing must remain identical to the original product image. Use Zoci’s luxury brand identity subtly and naturally: - Deep emerald/teal luxury tones - Warm champagne gold accents - Elegant pmium surfaces like dark marble, matte stone, soft velvet, brushed metal, or silk fabric - Minimal and refined luxury composition The lighting should feel realistic and natural like a professional jewellery photoshoot: - Soft studio lighting - Controlled reflections - Slight imperfections in reflections and shadows for realism - Balanced highlights without excessive glow - Natural depth of field Keep the image grounded and believable instead of hyper-stylized or CGI-looking. The jewellery should remain the hero of the frame with authentic material texture and realistic gold reflections. Visual style should resemble: high-end commercial jewellery photography shot in a professional studio for premium Indian jewellery brands. Avoid: overly cinematic lighting, excessive glow, unreal reflections, extreme sharpness, fantasy styling, floating objects, exaggerated luxury effects, artificial bokeh, or CGI appearance. Photorealistic, premium studio photography, elegant, realistic, refined luxury aesthetic, soft contrast, high detail."""
 
+_BRACELET_PROMPT_SUFFIX = (
+    "The object is a bracelet, joined on all sides, a complete circle. no disjoint parts"
+)
+_RING_PROMPT_SUFFIX = (
+    "The object is a ring, meant for 1 finger and 1 finger only. "
+    "I am giving you the front, side and back view. Notice the curves in the front and how it merges in the back. "
+    "Generate the ring for 1 finger taking account of these curves. "
+    "Make sure you join the ring in the back so that it doesnt look broken. "
+    "Understand where the finger goes in, it goes in through the colored hoop and out the embedded jewels hoop. "
+    "Ill give you a reference images of the ring in another color. According to that, generate for the ring with the multiangle view."
+)
+
+
+def category_prompt_suffix(category: str) -> str:
+    """Extra lines appended to default prompt1/prompt2 for certain categories."""
+    hay = (category or "").strip().lower()
+    if "bracelet" in hay:
+        return _BRACELET_PROMPT_SUFFIX
+    if "earring" in hay:
+        return ""
+    if "ring" in hay:
+        return _RING_PROMPT_SUFFIX
+    return ""
+
+
+def default_prompt_for_category(base_prompt: str, category: str) -> str:
+    """Return base prompt with category-specific suffix when applicable."""
+    suffix = category_prompt_suffix(category)
+    if not suffix:
+        return base_prompt
+    body = (base_prompt or "").rstrip()
+    if suffix in body:
+        return body
+    return f"{body}\n\n{suffix}"
+
 
 @dataclass(frozen=True)
 class WorkItem:

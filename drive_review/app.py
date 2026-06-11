@@ -29,11 +29,26 @@ from src.drive_client import (
 )
 from src.drive_outputs_sync import DriveOutputsSync
 from src.drive_review_config import DriveReviewConfig, load_drive_review_config
-from src.drive_stock_sync import rebuild_and_replace, refresh_stock_sheet, resolve_stock_path
+from src.drive_gallery import (
+    build_gallery_row,
+    distinct_categories,
+    filter_by_category,
+    gallery_readiness_light,
+    load_enriched_index,
+    local_workspace_needs_drive_pull,
+    paginate,
+    required_stock_columns,
+    scan_drive_metadata_for_skus,
+    list_gallery_skus,
+)
+from src.drive_stock_sync import rebuild_and_replace, rebuild_enriched_xlsx, refresh_stock_sheet, resolve_stock_path
 from src.drive_sync_orchestrator import (
+    SyncResult,
     check_save_everything_media,
     sku_ready_to_save,
     sync_after_regenerate,
+    sync_gallery_batch_save,
+    sync_regenerate_local_only,
     sync_save_everything,
     validate_local_workspace,
 )
@@ -46,6 +61,7 @@ from src.name_group import base_key_from_path
 from src.pipeline import (
     PROMPT_1,
     PROMPT_2,
+    default_prompt_for_category,
     generate_to_workspace,
     prepare_work_item_for_sku,
     reference_paths_for_sku,
@@ -54,6 +70,7 @@ from src.review_autofill import autofill_review_record
 from src.review_store import ReviewStore
 from src.title_store import TitleStore
 from src.drive_outputs_tally import tally_drive_vs_local, write_tally_report
+from src.drive_prompt_audit import audit_drive_prompt_images, write_prompt_audit_report
 from src.shopify_client import ShopifyClient
 from src.shopify_env import ShopifyConnectionState, ensure_shopify_connection, load_shopify_env
 from src.shopify_product_dedup import lookup_shopify_product, shopify_products_by_sku
@@ -63,6 +80,12 @@ from src.typo_sku_cleanup import write_audit_report
 from src.xlsx_ingest import index_by_sku, iter_rows
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+GALLERY_EDITED_KEY = "gallery_edited_skus"
+GALLERY_PULL_KEY = "gallery_pull_key"
+GALLERY_DRIVE_META_CACHE = "gallery_drive_meta_cache"
+GALLERY_COMPLETE_SKUS = "gallery_complete_skus"
+GALLERY_COMPLETE_CACHE_KEY = "gallery_complete_cache_key"
 
 
 def _safe_open(path: Path) -> Image.Image | None:
@@ -177,6 +200,10 @@ def _ensure_genai(cfg: DriveReviewConfig) -> GenAiImageClient:
 class _ShopifySession:
     connection: ShopifyConnectionState
     products_by_sku: dict[str, dict]
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.connection.connected)
 
     @property
     def client(self) -> ShopifyClient | None:
@@ -388,6 +415,245 @@ def _progress_callback(progress_bar, status_text):
     return _cb
 
 
+def _gallery_edited() -> dict[str, dict[str, int | None]]:
+    return st.session_state.setdefault(GALLERY_EDITED_KEY, {})
+
+
+def _mark_gallery_edited(sku: str, slot: str, version: int | None) -> None:
+    edited = _gallery_edited()
+    rec = edited.setdefault(sku, {"prompt1": None, "prompt2": None})
+    rec[slot] = version
+
+
+def _gallery_skip_prompt_slots(sku: str) -> frozenset[str]:
+    rec = _gallery_edited().get(sku) or {}
+    return frozenset(s for s in ("prompt1", "prompt2") if rec.get(s) is not None)
+
+
+def _gallery_page_cache_key(page: int, cat_filter: str, page_skus: list[str]) -> str:
+    return f"{page}:{cat_filter}:{','.join(page_skus)}"
+
+
+def _cached_gallery_complete_skus(
+    cfg: DriveReviewConfig,
+    enriched_index: dict,
+    *,
+    req_cols: list[str],
+    review_store: ReviewStore,
+) -> list[str]:
+    enriched_path = cfg.enriched_xlsx_path
+    mtime = enriched_path.stat().st_mtime if enriched_path.is_file() else 0
+    cache_key = f"{mtime}:{','.join(req_cols)}"
+    if st.session_state.get(GALLERY_COMPLETE_CACHE_KEY) == cache_key:
+        return list(st.session_state.get(GALLERY_COMPLETE_SKUS) or [])
+    skus = list_gallery_skus(cfg, enriched_index, required_cols=req_cols, review_store=review_store)
+    st.session_state[GALLERY_COMPLETE_CACHE_KEY] = cache_key
+    st.session_state[GALLERY_COMPLETE_SKUS] = skus
+    return skus
+
+
+def _cached_drive_meta_for_page(
+    sync: DriveOutputsSync,
+    *,
+    page_skus: list[str],
+    drive_folders: dict[str, str],
+    cache_key: str,
+) -> dict[str, dict]:
+    cache = st.session_state.setdefault(GALLERY_DRIVE_META_CACHE, {})
+    if cache_key in cache:
+        return cache[cache_key]
+    meta = scan_drive_metadata_for_skus(sync, page_skus, drive_folders=drive_folders)
+    cache[cache_key] = meta
+    return meta
+
+
+def _invalidate_gallery_caches() -> None:
+    st.session_state.pop(GALLERY_PULL_KEY, None)
+    st.session_state.pop(GALLERY_DRIVE_META_CACHE, None)
+    st.session_state.pop(GALLERY_COMPLETE_CACHE_KEY, None)
+    st.session_state.pop(GALLERY_COMPLETE_SKUS, None)
+
+
+def _pull_gallery_page_from_drive(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    *,
+    page_skus: list[str],
+    drive_folders: dict[str, str],
+    pull_key: str,
+) -> None:
+    if st.session_state.get(GALLERY_PULL_KEY) == pull_key:
+        return
+    need_pull = [
+        sku
+        for sku in page_skus
+        if drive_folders.get(sku)
+        and local_workspace_needs_drive_pull(
+            cfg,
+            sku,
+            ref_paths=reference_paths_for_sku(cfg.base, sku) or _list_candidates(cfg.base.images_dir, sku),
+        )
+    ]
+    if not need_pull:
+        st.session_state[GALLERY_PULL_KEY] = pull_key
+        return
+    with st.spinner(f"Loading {len(need_pull)} workspace(s) from Drive..."):
+        for sku in need_pull:
+            sync.pull_sku_from_drive(
+                sku,
+                folder_id=drive_folders[sku],
+                include_raw=True,
+                include_videos=False,
+                skip_prompt_slots=_gallery_skip_prompt_slots(sku),
+            )
+    st.session_state[GALLERY_PULL_KEY] = pull_key
+
+
+def _regenerate_prompt_for_sku(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    service,
+    *,
+    sku: str,
+    slot: str,
+    prompt_text: str,
+    gen_ctx: str,
+    review_store: ReviewStore,
+    gallery_local_only: bool = False,
+) -> None:
+    gen = _ensure_genai(cfg)
+    try:
+        work = prepare_work_item_for_sku(cfg.base, sku)
+        out_path, meta = generate_to_workspace(
+            cfg.base,
+            gen,
+            work,
+            prompt_slot=slot,
+            prompt_override=prompt_text,
+            extra_context=gen_ctx,
+        )
+        if gallery_local_only:
+            sync_regenerate_local_only(cfg, sku, prompt_slot=slot)
+            _mark_gallery_edited(sku, slot, meta.get("workspace_version"))
+            st.session_state[f"gallery_regen_msg::{sku}"] = (
+                f"Regenerated locally: {out_path.name} (save at bottom when done)"
+            )
+            st.rerun()
+        else:
+            result = sync_after_regenerate(cfg, sync, service, sku, prompt_slot=slot, review_store=review_store)
+            st.success(f"Saved {out_path.name}")
+            st.json(result)
+            st.rerun()
+    except genai_errors.ClientError as exc:
+        code = getattr(exc, "status_code", None)
+        if code == 429:
+            st.error(
+                f"Gemini quota exceeded for `{cfg.base.model}`. "
+                "Enable billing on your Google AI project or set `IMAGE_MODEL` in `.env`."
+            )
+        else:
+            st.error(f"Gemini API error ({code}): {exc}")
+    except Exception as exc:
+        st.error(f"Generation failed: {exc}")
+
+
+def _save_everything_for_sku(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    service,
+    *,
+    sku: str,
+    title: str,
+    category: str,
+    description: str,
+    tags: str,
+    prompt1_text: str,
+    prompt2_text: str,
+    product_id: str,
+    handle: str,
+    shopify: _ShopifySession,
+    shop_prod: dict | None,
+    review_store: ReviewStore,
+) -> SyncResult:
+    return sync_save_everything(
+        cfg,
+        sync,
+        service,
+        sku=sku,
+        title=title,
+        category=category,
+        description=description,
+        tags=tags,
+        prompt1_text=prompt1_text,
+        prompt2_text=prompt2_text,
+        product_id=product_id,
+        handle=handle,
+        shopify_client=shopify.client,
+        shop_prod=shop_prod,
+        review_store=review_store,
+    )
+
+
+def _show_save_result(
+    result: SyncResult,
+    *,
+    sku: str,
+    advance: bool = False,
+    cfg: DriveReviewConfig | None = None,
+    sync: DriveOutputsSync | None = None,
+    leases=None,
+    queue_skus: list[str] | None = None,
+) -> None:
+    if not (result.media_readiness or {}).get("ready"):
+        st.error("Save blocked — fix missing media first.")
+        for err in result.errors:
+            st.caption(f"• {err}")
+        st.json({"media_readiness": result.media_readiness, "errors": result.errors})
+        return
+    post = (result.drive_push or {}).get("post_push") or {}
+    skipped = (result.drive_push or {}).get("skipped_existing_raw_videos") or []
+    if post:
+        st.caption(
+            f"Drive — prompt1: {post.get('has_prompt1')}, prompt2: {post.get('has_prompt2')}, "
+            f"raw: {len(post.get('raw_on_drive') or [])} on Drive, "
+            f"videos: {len(post.get('videos_on_drive') or [])} on Drive"
+            + (f" (skipped {len(skipped)} upload(s))" if skipped else "")
+        )
+    if result.shopify:
+        st.caption(
+            f"Shopify — images: {result.shopify.get('image_count', 0)}/"
+            f"{result.shopify.get('expected_images', '?')}, "
+            f"videos: {result.shopify.get('video_count', 0)}/"
+            f"{result.shopify.get('expected_videos', 0)}"
+        )
+    if result.warnings:
+        for w in result.warnings:
+            st.caption(f"Note: {w}")
+    if result.errors:
+        st.warning("Saved with warnings:")
+        for err in result.errors:
+            st.caption(f"• {err}")
+    else:
+        st.success("Saved everything — Drive, Google Sheet" + (", and Shopify" if result.shopify else "."))
+    if advance and cfg and sync:
+        final_status = str(_review_store(cfg).get_record(sku).get("review_status") or "")
+        if final_status == "uploaded":
+            next_sku = _advance_after_save(cfg, sync, leases, skus=queue_skus or [], saved_sku=sku)
+            if next_sku:
+                st.info(f"Next open SKU: `{next_sku}`")
+            else:
+                st.info("No more open SKUs ready to save.")
+        else:
+            st.warning(f"SKU `{sku}` is still `{final_status}` — fix errors and save again.")
+    st.session_state[f"gallery_last_save::{sku}"] = {
+        "media_readiness": result.media_readiness,
+        "drive_push": result.drive_push,
+        "shopify": result.shopify,
+        "warnings": result.warnings,
+        "errors": result.errors,
+    }
+
+
 def _render_cleanup(cfg: DriveReviewConfig, sync: DriveOutputsSync, service) -> None:
     st.subheader("Typo Cleanup (Drive)")
     st.caption(
@@ -519,8 +785,14 @@ def _render_review_sku(
     category = st.text_input("Category", value=default_category, key=f"cat::{sku}")
     description = st.text_area("Description", value=str(rec.get("description") or ""), key=f"desc::{sku}")
     tags = st.text_input("Tags", value=str(rec.get("tags") or ""), key=f"tags::{sku}")
-    prompt1_text = st.text_area("Prompt1", value=str(rec.get("prompt1_text") or PROMPT_1), height=120, key=f"p1text::{sku}")
-    prompt2_text = st.text_area("Prompt2", value=str(rec.get("prompt2_text") or PROMPT_2), height=120, key=f"p2text::{sku}")
+    default_p1 = default_prompt_for_category(PROMPT_1, category)
+    default_p2 = default_prompt_for_category(PROMPT_2, category)
+    prompt1_text = st.text_area(
+        "Prompt1", value=str(rec.get("prompt1_text") or default_p1), height=120, key=f"p1text::{sku}",
+    )
+    prompt2_text = st.text_area(
+        "Prompt2", value=str(rec.get("prompt2_text") or default_p2), height=120, key=f"p2text::{sku}",
+    )
 
     ref_paths = reference_paths_for_sku(cfg.base, sku)
     if not ref_paths:
@@ -564,40 +836,18 @@ def _render_review_sku(
             for w in readiness["warnings"]:
                 st.caption(f"Note: {w}")
     g1, g2 = st.columns(2)
-    def _regenerate_prompt(*, slot: str, prompt_text: str) -> None:
-        try:
-            work = prepare_work_item_for_sku(cfg.base, sku)
-            out_path, _ = generate_to_workspace(
-                cfg.base,
-                gen,
-                work,
-                prompt_slot=slot,
-                prompt_override=prompt_text,
-                extra_context=gen_ctx,
-            )
-            result = sync_after_regenerate(cfg, sync, service, sku, prompt_slot=slot, review_store=review_store)
-            st.success(f"Saved {out_path.name}")
-            st.json(result)
-            st.rerun()
-        except genai_errors.ClientError as exc:
-            code = getattr(exc, "status_code", None)
-            if code == 429:
-                st.error(
-                    f"Gemini quota exceeded for `{cfg.base.model}`. "
-                    "Enable billing on your Google AI project or set `IMAGE_MODEL` in `.env` to a model your key supports. "
-                    "The client will retry automatically, but free-tier image models often have limit 0."
-                )
-            else:
-                st.error(f"Gemini API error ({code}): {exc}")
-        except Exception as exc:
-            st.error(f"Generation failed: {exc}")
-
     with g1:
         if st.button("Regenerate prompt1", disabled=not ref_paths, key=f"rp1::{sku}"):
-            _regenerate_prompt(slot="prompt1", prompt_text=prompt1_text)
+            _regenerate_prompt_for_sku(
+                cfg, sync, service,
+                sku=sku, slot="prompt1", prompt_text=prompt1_text, gen_ctx=gen_ctx, review_store=review_store,
+            )
     with g2:
         if st.button("Regenerate prompt2", disabled=not ref_paths, key=f"rp2::{sku}"):
-            _regenerate_prompt(slot="prompt2", prompt_text=prompt2_text)
+            _regenerate_prompt_for_sku(
+                cfg, sync, service,
+                sku=sku, slot="prompt2", prompt_text=prompt2_text, gen_ctx=gen_ctx, review_store=review_store,
+            )
 
     save_help = (
         "Validates prompt1, prompt2, raw images, and videos; pushes full workspace to Drive + Sheet. "
@@ -617,10 +867,8 @@ def _render_review_sku(
         help=save_help,
     ):
         with st.spinner("Saving to Drive, Google Sheet, and Shopify..."):
-            result = sync_save_everything(
-                cfg,
-                sync,
-                service,
+            result = _save_everything_for_sku(
+                cfg, sync, service,
                 sku=sku,
                 title=title,
                 category=category,
@@ -630,65 +878,21 @@ def _render_review_sku(
                 prompt2_text=prompt2_text,
                 product_id=product_id,
                 handle=str(rec.get("handle") or (shop_prod or {}).get("handle") or ""),
-                shopify_client=shopify.client,
+                shopify=shopify,
                 shop_prod=shop_prod,
                 review_store=review_store,
             )
-        if not (result.media_readiness or {}).get("ready"):
-            st.error("Save blocked — fix missing media first.")
-            for err in result.errors:
-                st.caption(f"• {err}")
-            st.json({"media_readiness": result.media_readiness, "errors": result.errors})
-            return
-        post = (result.drive_push or {}).get("post_push") or {}
-        skipped = (result.drive_push or {}).get("skipped_existing_raw_videos") or []
-        if post:
-            st.caption(
-                f"Drive — prompt1: {post.get('has_prompt1')}, prompt2: {post.get('has_prompt2')}, "
-                f"raw: {len(post.get('raw_on_drive') or [])} on Drive, "
-                f"videos: {len(post.get('videos_on_drive') or [])} on Drive"
-                + (f" (skipped {len(skipped)} upload(s))" if skipped else "")
-            )
-        if result.shopify:
-            st.caption(
-                f"Shopify — images: {result.shopify.get('image_count', 0)}/"
-                f"{result.shopify.get('expected_images', '?')}, "
-                f"videos: {result.shopify.get('video_count', 0)}/"
-                f"{result.shopify.get('expected_videos', 0)}"
-            )
-        if result.warnings:
-            for w in result.warnings:
-                st.caption(f"Note: {w}")
-        if result.errors:
-            st.warning("Saved with warnings:")
-            for err in result.errors:
-                st.caption(f"• {err}")
-        else:
-            st.success("Saved everything — Drive, Google Sheet" + (", and Shopify" if result.shopify else "."))
-        final_status = str(_review_store(cfg).get_record(sku).get("review_status") or "")
-        if final_status == "uploaded":
-            next_sku = _advance_after_save(cfg, sync, leases, skus=queue_skus, saved_sku=sku)
-            if next_sku:
-                st.info(f"Next open SKU: `{next_sku}`")
-            else:
-                st.info("No more open SKUs ready to save.")
-        else:
-            st.warning(
-                f"SKU `{sku}` is still `{final_status}` — Drive save may have failed. "
-                "Fix errors above and save again."
-            )
-        st.json(
-            {
-                "media_readiness": result.media_readiness,
-                "drive_push": result.drive_push,
-                "review_state_pushed": result.review_state_pushed,
-                "xlsx_replaced": result.xlsx_replaced,
-                "shopify": result.shopify,
-                "warnings": result.warnings,
-                "errors": result.errors,
-            }
+        _show_save_result(
+            result,
+            sku=sku,
+            advance=True,
+            cfg=cfg,
+            sync=sync,
+            leases=leases,
+            queue_skus=queue_skus,
         )
-        st.rerun()
+        if (result.media_readiness or {}).get("ready"):
+            st.rerun()
     if not can_save:
         missing = []
         if not has_both_prompts:
@@ -719,6 +923,274 @@ def _render_review_sku(
         imgs = images_for_sku(cfg.base, sku, review_store=review_store)
         paths = media_paths_for_sku(cfg.base, sku, review_store=review_store)
         st.write({"images": len(imgs), "videos": len(paths.get("videos") or [])})
+
+
+def _render_gallery_card(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    service,
+    *,
+    row,
+    media_idx,
+    shopify: _ShopifySession,
+    review_store: ReviewStore,
+    ref_paths: list[Path],
+) -> None:
+    sku = row.sku
+    rec = review_store.get_record(sku)
+    shop_prod, _ = lookup_shopify_product(shopify.products_by_sku, sku, review_store=review_store)
+    title = row.title or str(rec.get("title") or "")
+    category = row.category or title_case_category(str(rec.get("category") or ""))
+    description = row.description or str(rec.get("description") or "")
+    tags = str(rec.get("tags") or "")
+    prompt1_text = str(rec.get("prompt1_text") or default_prompt_for_category(PROMPT_1, category))
+    prompt2_text = str(rec.get("prompt2_text") or default_prompt_for_category(PROMPT_2, category))
+    product_id = row.product_id or str((shop_prod or {}).get("id") or "")
+    gen_ctx = product_generation_context(title=title, category=category)
+
+    h1, h2, h3 = st.columns([2, 1, 1])
+    with h1:
+        st.markdown(f"**`{sku}`**")
+    with h2:
+        st.caption(f"Review: `{row.review_status}`")
+    with h3:
+        edited = _gallery_edited().get(sku) or {}
+        edited_slots = [s for s in ("prompt1", "prompt2") if edited.get(s) is not None]
+        if edited_slots:
+            st.caption(f"**Edited** ({', '.join(edited_slots)})")
+        else:
+            st.caption("Ready" if row.save_ready else "Not ready")
+
+    st.caption(f"**{title}** · {category}")
+    if row.description:
+        st.caption(row.description[:200] + ("…" if len(row.description) > 200 else ""))
+
+    img1, img2 = st.columns(2)
+    with img1:
+        if media_idx.latest_prompt1:
+            st.image(_safe_open(media_idx.latest_prompt1), caption="prompt1", width="stretch")
+    with img2:
+        if media_idx.latest_prompt2:
+            st.image(_safe_open(media_idx.latest_prompt2), caption="prompt2", width="stretch")
+
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        st.caption(
+            f"**Local** raw {row.local_raw} · vid {row.local_videos} · "
+            f"p1 {'✓' if row.local_has_p1 else '✗'} · p2 {'✓' if row.local_has_p2 else '✗'}"
+        )
+    with s2:
+        st.caption(
+            f"**Drive** raw {row.drive_raw} · vid {row.drive_videos} · "
+            f"p1 {'✓' if row.drive_has_p1 else '✗'} · p2 {'✓' if row.drive_has_p2 else '✗'}"
+        )
+    with s3:
+        st.caption(
+            f"**Shopify** img {row.shopify_images} · vid {row.shopify_videos} · "
+            f"{'linked' if row.on_shopify else 'missing'}"
+        )
+    with s4:
+        st.caption(f"**Sheet** {'✓' if row.in_sheet else '✗'}")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Regen p1", key=f"gallery_rp1::{sku}", disabled=not ref_paths):
+            _regenerate_prompt_for_sku(
+                cfg, sync, service,
+                sku=sku, slot="prompt1", prompt_text=prompt1_text, gen_ctx=gen_ctx,
+                review_store=review_store, gallery_local_only=True,
+            )
+    with b2:
+        if st.button("Regen p2", key=f"gallery_rp2::{sku}", disabled=not ref_paths):
+            _regenerate_prompt_for_sku(
+                cfg, sync, service,
+                sku=sku, slot="prompt2", prompt_text=prompt2_text, gen_ctx=gen_ctx,
+                review_store=review_store, gallery_local_only=True,
+            )
+
+    regen_msg = st.session_state.pop(f"gallery_regen_msg::{sku}", None)
+    if regen_msg:
+        st.success(regen_msg)
+
+    with st.expander("Details", expanded=False):
+        st.write(row.readiness)
+        last = st.session_state.get(f"gallery_last_save::{sku}")
+        if last:
+            st.json(last)
+
+
+def _render_gallery(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    service,
+    shopify: _ShopifySession,
+) -> None:
+    st.subheader("Gallery — final batch review")
+    st.caption(
+        f"Loads prompts + raw from Drive, regenerate locally in batch, then **Save edited** at the bottom "
+        f"to push only changed prompt images (raw/videos untouched)."
+    )
+
+    review_store = _review_store(cfg)
+    enriched_path = cfg.enriched_xlsx_path
+
+    if not enriched_path.is_file():
+        st.warning(f"Enriched stock file missing: `{enriched_path}`")
+        if st.button("Rebuild enriched xlsx", type="primary", key="gallery_rebuild_enriched"):
+            with st.spinner("Rebuilding enriched export..."):
+                rebuild_enriched_xlsx(cfg, service, review_store=review_store)
+            st.success(f"Rebuilt `{enriched_path}`")
+            st.rerun()
+        return
+
+    enriched_index, headers = load_enriched_index(enriched_path)
+    if not enriched_index:
+        st.error("Enriched file has no SKU rows.")
+        return
+
+    req_cols = required_stock_columns(headers, enriched_index)
+    all_complete = _cached_gallery_complete_skus(
+        cfg, enriched_index, req_cols=req_cols, review_store=review_store,
+    )
+
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1, 2])
+    with ctrl1:
+        page_size = st.selectbox("Page size", [20, 30, 50], index=0, key="gallery_page_size")
+    categories = ["ALL"] + distinct_categories(enriched_index, all_complete)
+    with ctrl2:
+        cat_filter = st.selectbox("Category", categories, key="gallery_category")
+    filtered = filter_by_category(all_complete, enriched_index, cat_filter)
+    page = int(st.session_state.get("gallery_page") or 1)
+    page_skus, total_pages, total_count = paginate(filtered, page=page, page_size=page_size)
+
+    with ctrl3:
+        if st.button("Refresh gallery data", key="gallery_refresh"):
+            st.session_state.pop("gallery_drive_folders", None)
+            _invalidate_gallery_caches()
+            st.session_state["gallery_page"] = 1
+            st.rerun()
+    with ctrl4:
+        st.caption(f"**{len(page_skus)}** on page · **{total_count}** complete SKUs · filter: `{cat_filter}`")
+
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+    with nav1:
+        if st.button("← Prev", disabled=page <= 1, key="gallery_prev"):
+            st.session_state["gallery_page"] = max(1, page - 1)
+            st.rerun()
+    with nav2:
+        st.markdown(f"<div style='text-align:center'>Page **{page}** of **{total_pages or 1}**</div>", unsafe_allow_html=True)
+    with nav3:
+        if st.button("Next →", disabled=page >= (total_pages or 1), key="gallery_next"):
+            st.session_state["gallery_page"] = min(total_pages or 1, page + 1)
+            st.rerun()
+
+    if not page_skus:
+        st.info("No complete SKUs match the current filter.")
+        return
+
+    if "gallery_drive_folders" not in st.session_state:
+        st.session_state["gallery_drive_folders"] = sync.list_sku_folders(refresh=False)
+    drive_folders = st.session_state["gallery_drive_folders"]
+    page_cache_key = _gallery_page_cache_key(page, cat_filter, page_skus)
+    _pull_gallery_page_from_drive(
+        cfg, sync, page_skus=page_skus, drive_folders=drive_folders, pull_key=page_cache_key,
+    )
+    drive_meta_by_sku = _cached_drive_meta_for_page(
+        sync, page_skus=page_skus, drive_folders=drive_folders, cache_key=page_cache_key,
+    )
+
+    cols = st.columns(2)
+    for i, sku in enumerate(page_skus):
+        enriched_row = enriched_index.get(sku) or {}
+        media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=sku)
+        shop_prod, _ = lookup_shopify_product(shopify.products_by_sku, sku, review_store=review_store)
+        review_rec = review_store.get_record(sku)
+        readiness = gallery_readiness_light(
+            media_idx=media_idx,
+            drive_meta=drive_meta_by_sku.get(sku),
+            shop_prod=shop_prod,
+        )
+        row = build_gallery_row(
+            sku,
+            cfg=cfg,
+            enriched_row=enriched_row,
+            media_idx=media_idx,
+            drive_meta=drive_meta_by_sku.get(sku),
+            shop_prod=shop_prod,
+            review_rec=review_rec,
+            readiness=readiness,
+            drive_folders=set(drive_folders.keys()),
+        )
+        ref_paths = reference_paths_for_sku(cfg.base, sku) or _list_candidates(cfg.base.images_dir, sku)
+        with cols[i % 2]:
+            with st.container(border=True):
+                _render_gallery_card(
+                    cfg, sync, service,
+                    row=row,
+                    media_idx=media_idx,
+                    shopify=shopify,
+                    review_store=review_store,
+                    ref_paths=ref_paths,
+                )
+
+    edited_all = _gallery_edited()
+    edited_skus = {sku: slots for sku, slots in edited_all.items() if any(slots.get(s) is not None for s in ("prompt1", "prompt2"))}
+    page_edited = {sku: slots for sku, slots in edited_skus.items() if sku in page_skus}
+    st.divider()
+    st.subheader("Save edited on this page")
+    if page_edited:
+        st.caption(
+            f"**{len(page_edited)}** SKU(s) edited on this page will upload only changed prompt images "
+            f"(Drive + Shopify replace; raw/videos skipped)."
+        )
+        for sku, slots in sorted(page_edited.items()):
+            parts = [f"{s} v{slots[s]}" for s in ("prompt1", "prompt2") if slots.get(s) is not None]
+            st.caption(f"• `{sku}` — {', '.join(parts)}")
+    else:
+        st.caption("No edits on this page yet. Regenerate images above, then save here.")
+
+    save_col1, save_col2 = st.columns([1, 2])
+    with save_col1:
+        if st.button(
+            f"Save edited ({len(page_edited)})",
+            type="primary",
+            key="gallery_save_edited_page",
+            disabled=not page_edited,
+        ):
+            with st.spinner(f"Saving {len(page_edited)} edited SKU(s)..."):
+                results = sync_gallery_batch_save(
+                    cfg,
+                    sync,
+                    edited=page_edited,
+                    shopify_client=shopify.client if shopify.connected else None,
+                    products_by_sku=shopify.products_by_sku,
+                    review_store=review_store,
+                )
+            ok = err = 0
+            for result in results:
+                if result.errors:
+                    err += 1
+                    st.warning(f"`{result.sku}`: {', '.join(result.errors)}")
+                else:
+                    ok += 1
+            if ok:
+                st.success(f"Saved {ok} SKU(s) — prompt images only.")
+            for sku in page_edited:
+                rec = edited_all.get(sku) or {}
+                rec["prompt1"] = None
+                rec["prompt2"] = None
+                if not any(rec.get(s) is not None for s in ("prompt1", "prompt2")):
+                    edited_all.pop(sku, None)
+            st.session_state[GALLERY_EDITED_KEY] = edited_all
+            st.session_state.pop(GALLERY_DRIVE_META_CACHE, None)
+            st.rerun()
+    with save_col2:
+        session_edited_count = len(edited_skus)
+        if session_edited_count > len(page_edited):
+            st.caption(
+                f"**{session_edited_count - len(page_edited)}** more edited SKU(s) on other pages — "
+                "navigate there to save them."
+            )
 
 
 def _render_review_queue(cfg: DriveReviewConfig, sync: DriveOutputsSync, service, shopify: _ShopifySession, leases) -> None:
@@ -861,11 +1333,15 @@ def main() -> None:
         st.exception(e)
         return
 
-    tab_cleanup, tab_review, tab_tools = st.tabs(["Typo Cleanup", "Review Queue", "Tools"])
+    tab_cleanup, tab_review, tab_gallery, tab_tools = st.tabs(
+        ["Typo Cleanup", "Review Queue", "Gallery", "Tools"]
+    )
     with tab_cleanup:
         _render_cleanup(cfg, sync, service)
     with tab_review:
         _render_review_queue(cfg, sync, service, shopify_session, leases)
+    with tab_gallery:
+        _render_gallery(cfg, sync, service, shopify_session)
     with tab_tools:
         st.subheader("Tools")
         st.caption(
@@ -914,6 +1390,38 @@ def main() -> None:
                     st.write(tally.get("needs_push_to_drive") or [])
                 with st.expander("Full summary"):
                     st.json(s)
+            except Exception as e:
+                st.error(str(e))
+                st.exception(e)
+        if st.button("Audit Drive prompt1+prompt2", type="primary"):
+            progress = st.progress(0, text="Scanning Drive SKU folders...")
+            status = st.empty()
+            try:
+                audit = audit_drive_prompt_images(
+                    cfg,
+                    sync,
+                    progress=_progress_callback(progress, status),
+                )
+                json_path, md_path = write_prompt_audit_report(audit, cfg.outputs_dir)
+                sync.push_file_to_outputs_root(json_path)
+                sync.push_file_to_outputs_root(md_path)
+                progress.progress(1.0, text="Audit complete")
+                s = audit.get("summary") or {}
+                st.success(
+                    f"Drive audit done in {s.get('elapsed_seconds', '?')}s — "
+                    f"folders={s.get('drive_sku_folders', 0)}, "
+                    f"complete={s.get('complete_both_prompts', 0)}, "
+                    f"missing_p1={s.get('missing_prompt1', 0)}, "
+                    f"missing_p2={s.get('missing_prompt2', 0)}, "
+                    f"missing_both={s.get('missing_both', 0)}"
+                )
+                st.caption(f"Reports: `{json_path.name}`, `{md_path.name}` (uploaded to Drive)")
+                with st.expander("Missing prompt1"):
+                    st.write(audit.get("missing_prompt1") or [])
+                with st.expander("Missing prompt2"):
+                    st.write(audit.get("missing_prompt2") or [])
+                with st.expander("Missing both"):
+                    st.write(audit.get("missing_both") or [])
             except Exception as e:
                 st.error(str(e))
                 st.exception(e)

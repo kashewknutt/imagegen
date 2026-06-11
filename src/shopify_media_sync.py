@@ -242,6 +242,80 @@ def sync_product_media(
     }
 
 
+PROMPT_SLOT_IMAGE_INDEX = {"prompt2": 0, "prompt1": 1}
+
+
+def _shopify_image_media(shop_media: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        m
+        for m in shop_media
+        if str(m.get("content_type") or "IMAGE").upper() not in {"VIDEO", "EXTERNAL_VIDEO"}
+    ]
+
+
+def replace_prompt_images_on_product(
+    client,
+    *,
+    product_id: str,
+    sku: str,
+    slots: list[str],
+    shop_media: list[dict[str, Any]] | None = None,
+    review_store: "ReviewStore | None" = None,
+    cfg=None,
+) -> dict[str, Any]:
+    """
+    Replace only prompt1 and/or prompt2 on Shopify (position 1=lifestyle, 0=product thumbnail).
+    Does not touch raw images or videos.
+    """
+    if not slots:
+        return {"replaced": [], "skipped": ["no_slots"]}
+
+    paths = media_paths_for_sku(cfg, sku, review_store=review_store)
+    sku_dir = paths["sku_dir"]
+    images = _shopify_image_media(shop_media or [])
+    replaced: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for slot in slots:
+        slot = slot.strip().lower()
+        idx = PROMPT_SLOT_IMAGE_INDEX.get(slot)
+        img_path = latest_prompt_path(sku_dir, slot)
+        if idx is None:
+            errors.append(f"unknown_slot:{slot}")
+            continue
+        if img_path is None or not img_path.is_file():
+            errors.append(f"missing_local:{slot}")
+            continue
+        if idx >= len(images):
+            errors.append(f"shopify_missing_image_at_index:{slot}:{idx}")
+            continue
+        old_id = str(images[idx].get("id") or "")
+        if not old_id:
+            errors.append(f"shopify_missing_media_id:{slot}")
+            continue
+        try:
+            result = client.replace_product_image(
+                product_id=product_id,
+                old_media_id=old_id,
+                file_bytes=img_path.read_bytes(),
+                filename=img_path.name,
+                mime_type=_mime_for(img_path),
+                alt=f"{sku} - {'Product' if slot == 'prompt2' else 'Lifestyle'}",
+            )
+            new_attached = result.get("attached") or []
+            new_id = str((new_attached[0] or {}).get("id") or "") if new_attached else ""
+            replaced.append({"slot": slot, "old_media_id": old_id, "new_media_id": new_id})
+            if slot == "prompt2" and new_id:
+                try:
+                    client.product_set_featured_media(product_id=product_id, media_id=new_id)
+                except Exception as e:
+                    log.warning("[%s] Could not set featured media after prompt2 replace: %s", sku, e)
+        except Exception as e:
+            errors.append(f"{slot}:{e}")
+
+    return {"replaced": replaced, "errors": errors}
+
+
 def update_shopify_product_from_review(
     client,
     cfg,

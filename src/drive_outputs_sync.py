@@ -11,6 +11,7 @@ from src.drive_client import (
     DriveFile,
     create_folder,
     delete_file,
+    download_file_to_cache,
     list_children,
     upload_or_update_file,
 )
@@ -158,6 +159,152 @@ class DriveOutputsSync:
         if not sku_dir.is_dir():
             raise FileNotFoundError(f"Local workspace missing: {sku_dir}")
         return sku_dir
+
+    def pull_sku_from_drive(
+        self,
+        sku: str,
+        *,
+        folder_id: str | None = None,
+        include_raw: bool = True,
+        include_videos: bool = False,
+        skip_prompt_slots: frozenset[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Download Drive workspace files into local outputs/{sku}/.
+        Skips prompt slots listed in skip_prompt_slots (e.g. locally edited, unsaved).
+        """
+        skip_prompt_slots = skip_prompt_slots or frozenset()
+        folder_id = folder_id or self.list_sku_folders().get(sku)
+        if not folder_id:
+            return {"sku": sku, "downloaded": [], "skipped": ["no_drive_folder"]}
+
+        sku_dir = self.local_sku_dir(sku)
+        sku_dir.mkdir(parents=True, exist_ok=True)
+        downloaded: list[str] = []
+        skipped: list[str] = []
+
+        def _dest_for(name: str, parent_name: str | None = None) -> Path:
+            if parent_name:
+                return sku_dir / parent_name / name
+            return sku_dir / name
+
+        def _pull_file(item: DriveFile, dest: Path) -> None:
+            if dest.exists() and dest.stat().st_size > 0:
+                skipped.append(str(dest.relative_to(self.cfg.outputs_dir)))
+                return
+            download_file_to_cache(service=self.service, file_id=item.id, cache_path=dest)
+            downloaded.append(str(dest.relative_to(self.cfg.outputs_dir)))
+
+        for item in list_children(service=self.service, parent_id=folder_id):
+            if item.mime_type == FOLDER_MIME:
+                if item.name == "raw" and include_raw:
+                    raw_dir = sku_dir / "raw"
+                    raw_dir.mkdir(parents=True, exist_ok=True)
+                    for sub in list_children(service=self.service, parent_id=item.id):
+                        if sub.mime_type != FOLDER_MIME:
+                            _pull_file(sub, raw_dir / sub.name)
+                elif item.name == "videos" and include_videos:
+                    vid_dir = sku_dir / "videos"
+                    vid_dir.mkdir(parents=True, exist_ok=True)
+                    for sub in list_children(service=self.service, parent_id=item.id):
+                        if sub.mime_type != FOLDER_MIME:
+                            _pull_file(sub, vid_dir / sub.name)
+                continue
+            m = PROMPT_VERSION_FILE_RE.match(item.name)
+            if m:
+                slot = "prompt1" if m.group(1) == "1" else "prompt2"
+                if slot in skip_prompt_slots:
+                    skipped.append(f"{sku}/{item.name}")
+                    continue
+            _pull_file(item, _dest_for(item.name))
+
+        return {"sku": sku, "downloaded": downloaded, "skipped": skipped}
+
+    def push_prompt_files(
+        self,
+        sku: str,
+        *,
+        folder_id: str | None = None,
+        slots: list[str] | None = None,
+        prune_old: bool = True,
+    ) -> dict[str, Any]:
+        """Upload only prompt1/prompt2 files for a SKU; never touches raw/ or videos/."""
+        log = get_logger()
+        sku_dir = self.local_sku_dir(sku)
+        if not sku_dir.is_dir():
+            raise FileNotFoundError(sku_dir)
+        folder_id = folder_id or self.ensure_sku_folder(sku)
+        remote_names = set(self.list_sku_filenames(folder_id))
+        file_map = self._load_map(self._file_map_path).setdefault("files", {})
+        want_slots = {s.strip().lower() for s in (slots or ["prompt1", "prompt2"])}
+        uploaded: list[str] = []
+
+        def _push_file(local_path: Path) -> None:
+            rel_key = f"{sku}/{local_path.name}"
+            name = local_path.name
+            existing_id = file_map.get(rel_key)
+            if existing_id:
+                try:
+                    upload_or_update_file(
+                        service=self.service,
+                        local_path=local_path,
+                        parent_id=folder_id,
+                        name=name,
+                        file_id=existing_id,
+                    )
+                    uploaded.append(rel_key)
+                    return
+                except Exception:
+                    existing_id = None
+            for rf in list_children(service=self.service, parent_id=folder_id):
+                if rf.name == name and rf.mime_type != FOLDER_MIME:
+                    existing_id = rf.id
+                    break
+            result = upload_or_update_file(
+                service=self.service,
+                local_path=local_path,
+                parent_id=folder_id,
+                name=name,
+                file_id=existing_id,
+            )
+            file_map[rel_key] = result.id
+            uploaded.append(rel_key)
+
+        latest_paths: dict[str, Path] = {}
+        latest_versions: dict[str, int] = {}
+        for path in sorted(sku_dir.iterdir()):
+            if not path.is_file():
+                continue
+            m = PROMPT_VERSION_FILE_RE.match(path.name)
+            if not m:
+                continue
+            slot = "prompt1" if m.group(1) == "1" else "prompt2"
+            if slot not in want_slots:
+                continue
+            ver = int(m.group(2))
+            if ver >= latest_versions.get(slot, 0):
+                latest_versions[slot] = ver
+                latest_paths[slot] = path
+        for path in latest_paths.values():
+            _push_file(path)
+
+        pruned: list[str] = []
+        if prune_old and latest_versions:
+            pruned = self.prune_remote_prompt_versions(
+                sku,
+                keep_p1=latest_versions.get("prompt1"),
+                keep_p2=latest_versions.get("prompt2"),
+            )
+
+        self._save_map(self._file_map_path, {"files": file_map})
+        log.info("Pushed prompt files for %s: %s", sku, uploaded)
+        return {
+            "sku": sku,
+            "uploaded": uploaded,
+            "pruned_old_prompts": pruned,
+            "latest_versions": latest_versions,
+            "folder_id": folder_id,
+        }
 
     def check_drive_raw_videos(self, sku: str) -> dict[str, Any]:
         """Compare local raw images and videos against Drive folder (metadata only)."""

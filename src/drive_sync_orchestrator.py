@@ -10,7 +10,12 @@ from src.drive_review_config import DriveReviewConfig
 from src.drive_stock_sync import rebuild_and_replace
 from src.media_workspace import index_sku_media, refresh_manifest
 from src.review_store import ReviewStore
-from src.shopify_media_sync import images_for_sku, media_paths_for_sku, update_shopify_product_from_review
+from src.shopify_media_sync import (
+    images_for_sku,
+    media_paths_for_sku,
+    replace_prompt_images_on_product,
+    update_shopify_product_from_review,
+)
 from src.text_format import title_case_category
 
 OPEN_SAVE_STATUSES = frozenset({"pending_review", "approved", "failed"})
@@ -78,6 +83,92 @@ def sync_after_regenerate(
         review_store=review_store,
         push_xlsx=prompt_slot == "prompt2",
     )
+
+
+def sync_regenerate_local_only(
+    cfg: DriveReviewConfig,
+    sku: str,
+    *,
+    prompt_slot: str,
+) -> dict[str, Any]:
+    """Refresh manifest after a local-only gallery regen; no Drive/Shopify/Sheet sync."""
+    refresh_manifest(outputs_dir=cfg.outputs_dir, sku=sku)
+    p1, p2 = _latest_prompt_versions(cfg, sku)
+    ver = p1 if prompt_slot == "prompt1" else p2
+    return {
+        "sku": sku,
+        "prompt_slot": prompt_slot,
+        "version": ver,
+        "local_only": True,
+    }
+
+
+def sync_gallery_batch_save(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    *,
+    edited: dict[str, dict[str, int | None]],
+    shopify_client=None,
+    products_by_sku: dict[str, dict] | None = None,
+    review_store: ReviewStore | None = None,
+) -> list[SyncResult]:
+    """
+    Push only edited prompt images to Drive and replace matching slots on Shopify.
+    Skips raw images and videos entirely.
+    """
+    review_store = review_store or ReviewStore(cfg.review_state_path)
+    products_by_sku = products_by_sku or {}
+    results: list[SyncResult] = []
+
+    for sku, slots_ver in sorted(edited.items()):
+        slots = [s for s in ("prompt1", "prompt2") if slots_ver.get(s) is not None]
+        if not slots:
+            continue
+
+        result = SyncResult(sku=sku, reason="gallery_batch_save")
+        p1_ver, p2_ver = _latest_prompt_versions(cfg, sku)
+        rec = review_store.get_record(sku)
+        product_id = str(rec.get("product_id") or (products_by_sku.get(sku) or {}).get("id") or "").strip()
+
+        try:
+            result.drive_push = sync.push_prompt_files(sku, slots=slots, prune_old=True)
+        except Exception as e:
+            result.errors.append(f"drive_push: {e}")
+
+        store_patch: dict[str, Any] = {}
+        manifest_patch: dict[str, Any] = {"review_status": rec.get("review_status") or "uploaded"}
+        if p1_ver is not None:
+            store_patch["approved_prompt1_version"] = p1_ver
+            manifest_patch["approved_prompt1_version"] = p1_ver
+        if p2_ver is not None:
+            store_patch["approved_prompt2_version"] = p2_ver
+            manifest_patch["approved_prompt2_version"] = p2_ver
+        if store_patch:
+            review_store.update(sku, **store_patch)
+        refresh_manifest(outputs_dir=cfg.outputs_dir, sku=sku, patch=manifest_patch)
+
+        if shopify_client and product_id:
+            shop_prod = products_by_sku.get(sku)
+            try:
+                result.shopify = replace_prompt_images_on_product(
+                    shopify_client,
+                    product_id=product_id,
+                    sku=sku,
+                    slots=slots,
+                    shop_media=(shop_prod or {}).get("media"),
+                    review_store=review_store,
+                    cfg=cfg.base,
+                )
+                if result.shopify.get("errors"):
+                    result.errors.extend(result.shopify["errors"])
+            except Exception as e:
+                result.errors.append(f"shopify_replace: {e}")
+        elif shopify_client and not product_id:
+            result.warnings.append("shopify_skipped: no product_id")
+
+        results.append(result)
+
+    return results
 
 
 def sync_after_approve(
