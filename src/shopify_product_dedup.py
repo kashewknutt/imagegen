@@ -103,6 +103,52 @@ def is_active_shopify_product(prod: dict[str, Any]) -> bool:
     return str(prod.get("status") or "ACTIVE").upper() not in {"ARCHIVED", "DRAFT"}
 
 
+def shopify_products_by_sku(
+    client,
+    *,
+    active_only: bool = False,
+    review_store=None,
+) -> dict[str, dict[str, Any]]:
+    """Deduplicated SKU -> product map for reliable lookups (not search-query based)."""
+    products = fetch_all_shopify_products(client, active_only=active_only)
+    deduped = dedupe_products_by_sku(products, review_store=review_store)
+    out: dict[str, dict[str, Any]] = {}
+    for prod in deduped:
+        sku = primary_sku_from_product(prod)
+        if sku:
+            out[sku] = prod
+    return out
+
+
+def lookup_shopify_product(
+    products_by_sku: dict[str, dict[str, Any]],
+    sku: str,
+    *,
+    review_store=None,
+) -> tuple[dict[str, Any] | None, str]:
+    """
+    Resolve a product for a workspace SKU.
+    Returns (product, message). message is empty when product is found.
+    """
+    sku = (sku or "").strip()
+    if not sku:
+        return None, "SKU is empty."
+
+    prod = products_by_sku.get(sku)
+    if prod:
+        return prod, ""
+
+    if review_store is not None:
+        rec = review_store.get_record(sku)
+        pid = str(rec.get("product_id") or "").strip()
+        if pid:
+            for candidate in products_by_sku.values():
+                if str(candidate.get("id") or "") == pid:
+                    return candidate, ""
+
+    return None, f"No Shopify product with variant SKU `{sku}`."
+
+
 def fetch_all_shopify_products(
     client,
     *,

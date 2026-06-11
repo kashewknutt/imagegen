@@ -21,10 +21,13 @@ cost_log_csv: "outputs/cost_log.csv"
 # Google model
 # "nanobanana" in this project maps to Gemini image generation models.
 # Gemini 3 image models (preview) per Vertex AI docs:
-# - gemini-3.1-flash-image-preview
-# Stable option:
+# - gemini-3.1-flash-image-preview  (recommended — paid tier image gen)
+# Legacy (may hit free-tier quota 0):
 # - gemini-2.5-flash-image
-model: "models/gemini-2.5-flash-image"
+model: "models/gemini-3.1-flash-image-preview"
+
+# Vision/text model for titles, descriptions, classification (NOT image generation).
+title_model: "models/gemini-3-flash-preview"
 
 # Optional: pricing table for estimated costs (USD). Leave empty to log tokens only.
 # Values are per 1M tokens.
@@ -64,6 +67,11 @@ pricing_usd_per_million_tokens:
     input_text: 0.30
     input_image: 0.30
     output_text: 2.50
+    output_image: 0.0
+  models/gemini-3-flash-preview:
+    input_text: 0.50
+    input_image: 0.50
+    output_text: 3.0
     output_image: 0.0
 
   # Imagen pricing is per-image (not token-based). Not used by this app (Imagen models use `predict`, not `generateContent`).

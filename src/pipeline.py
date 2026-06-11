@@ -11,11 +11,15 @@ from .config import AppConfig
 from .csv_ingest import CsvEntry, iter_entries
 from .genai_client import GenAiImageClient
 from .image_resolve import (
+    SUPPORTED_EXTS,
     download_first_image_url,
     find_local_image,
     open_pil,
     parse_media_links,
 )
+from .media_workspace import list_raw_images, sku_workspace_dir
+from .name_group import base_key_from_path
+from .sku_aliases import canonical_sku
 from .quality_guard import METAL_GUARDRAIL_SUFFIX, check_similarity
 from .state_store import StateStore
 
@@ -65,6 +69,36 @@ def write_missing_report(cfg: AppConfig, missing_skus: list[str]) -> None:
 
 def prepare_work_item_for_path(cfg: AppConfig, key: str, reference_path: Path) -> WorkItem:
     return WorkItem(key=key, reference_paths=[reference_path], reference_rgbs=[open_pil(reference_path)])
+
+
+def reference_paths_for_sku(cfg: AppConfig, key: str) -> list[Path]:
+    """All raw reference images for a SKU: outputs/{SKU}/raw/ first, then DAIJE/images_dir."""
+    key = (key or "").strip()
+    if not key:
+        return []
+    sku_dir = sku_workspace_dir(cfg.outputs_dir, key)
+    paths = [p for p in list_raw_images(sku_dir) if p.is_file()]
+    if paths:
+        return paths
+    if cfg.images_dir.exists():
+        keys = {key, canonical_sku(key)}
+        found = sorted(
+            p
+            for p in cfg.images_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS and base_key_from_path(p) in keys
+        )
+        if found:
+            return found
+    legacy = find_local_image(cfg.images_dir, key, "")
+    return [legacy] if legacy and legacy.is_file() else []
+
+
+def prepare_work_item_for_sku(cfg: AppConfig, key: str) -> WorkItem:
+    """Build a WorkItem using every available raw reference image for the SKU."""
+    paths = reference_paths_for_sku(cfg, key)
+    if not paths:
+        raise FileNotFoundError(f"No reference images for {key}")
+    return prepare_work_item_for_paths(cfg, key, paths)
 
 
 def prepare_work_item_for_paths(cfg: AppConfig, key: str, reference_paths: list[Path]) -> WorkItem:

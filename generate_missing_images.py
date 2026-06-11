@@ -12,8 +12,7 @@ from dotenv import load_dotenv
 
 from src.config import load_config
 from src.genai_client import GenAiImageClient
-from src.image_resolve import find_local_image
-from src.pipeline import approve, generate_pair, prepare_work_item_for_path
+from src.pipeline import approve, generate_pair, prepare_work_item_for_sku, reference_paths_for_sku
 from src.state_store import StateStore
 
 log = logging.getLogger("gen_missing_images")
@@ -45,13 +44,14 @@ def generate_for_sku(
         log.info("%s — already has prompt2, skipping", sku)
         return True
 
-    raw = find_local_image(cfg.images_dir, sku, "")
-    if not raw or not raw.is_file():
-        log.error("%s — no raw reference image in %s", sku, cfg.images_dir)
+    refs = reference_paths_for_sku(cfg, sku)
+    if not refs:
+        log.error("%s — no raw reference images in workspace or %s", sku, cfg.images_dir)
         return False
 
     store.ensure_skus([sku])
-    work = prepare_work_item_for_path(cfg, sku, raw)
+    log.info("%s — using %d reference image(s): %s", sku, len(refs), ", ".join(p.name for p in refs))
+    work = prepare_work_item_for_sku(cfg, sku)
     run_cfg = replace(cfg, quality_guard_enabled=quality_guard_enabled)
 
     p1_path = p2_path = None

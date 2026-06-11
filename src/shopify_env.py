@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,6 +11,17 @@ from dotenv import load_dotenv
 from src.shopify_client import ShopifyClient, ShopifyConfig
 from src.shopify_settings import ShopifySettings, load_shopify_settings, save_shopify_settings
 from src.shopify_token_cache import CachedToken, load_cached_token, save_cached_token
+
+
+def _normalize_shop_domain(domain: str) -> str:
+    d = (domain or "").strip().replace("https://", "").replace("http://", "").rstrip("/")
+    if not d:
+        return ""
+    if d.endswith("/admin"):
+        d = d[: -len("/admin")]
+    if not d.endswith(".myshopify.com"):
+        d = f"{d}.myshopify.com"
+    return d
 
 
 @dataclass(frozen=True)
@@ -30,10 +41,15 @@ class ShopifyEnvConfig:
         return bool(self.client_id and self.client_secret)
 
 
-def load_shopify_env() -> ShopifyEnvConfig:
-    load_dotenv(override=False)
+def load_shopify_env(*, env_path: Path | None = None) -> ShopifyEnvConfig:
+    if env_path and env_path.is_file():
+        load_dotenv(env_path, override=False)
+    else:
+        load_dotenv(override=False)
     return ShopifyEnvConfig(
-        shop_domain=(os.getenv("SHOPIFY_SHOP_DOMAIN") or os.getenv("shopify_shop_domain") or "").strip(),
+        shop_domain=_normalize_shop_domain(
+            os.getenv("SHOPIFY_SHOP_DOMAIN") or os.getenv("shopify_shop_domain") or ""
+        ),
         client_id=(os.getenv("SHOPIFY_CLIENT_ID") or os.getenv("shopify_client_id") or "").strip(),
         client_secret=(os.getenv("SHOPIFY_CLIENT_SECRET") or os.getenv("shopify_client_secret") or "").strip(),
         access_token=(os.getenv("SHOPIFY_ACCESS_TOKEN") or os.getenv("shopify_access_token") or "").strip(),
@@ -98,8 +114,8 @@ def _resolve_access_token(env: ShopifyEnvConfig, outputs_dir: Path) -> str:
     )
 
 
-def shopify_client_from_env(outputs_dir: Path) -> ShopifyClient | None:
-    env = load_shopify_env()
+def shopify_client_from_env(outputs_dir: Path, *, env_path: Path | None = None) -> ShopifyClient | None:
+    env = load_shopify_env(env_path=env_path)
     if not env.configured:
         return None
     token = _resolve_access_token(env, outputs_dir)
@@ -110,3 +126,78 @@ def shopify_client_from_env(outputs_dir: Path) -> ShopifyClient | None:
             api_version=env.api_version,
         )
     )
+
+
+@dataclass
+class ShopifyConnectionState:
+    connected: bool
+    client: ShopifyClient | None = None
+    shop_name: str = ""
+    shop_domain: str = ""
+    error: str = ""
+    missing_env: list[str] = field(default_factory=list)
+
+    @property
+    def status_label(self) -> str:
+        if self.connected and self.shop_name:
+            return f"Connected — {self.shop_name}"
+        if self.missing_env:
+            return f"Not configured — missing {', '.join(self.missing_env)}"
+        if self.error:
+            return f"Connection failed — {self.error}"
+        return "Not connected"
+
+
+def _missing_shopify_env_vars(env: ShopifyEnvConfig) -> list[str]:
+    missing: list[str] = []
+    if not env.shop_domain:
+        missing.append("SHOPIFY_SHOP_DOMAIN")
+    if not env.access_token:
+        if not env.client_id:
+            missing.append("SHOPIFY_CLIENT_ID")
+        if not env.client_secret:
+            missing.append("SHOPIFY_CLIENT_SECRET")
+    return missing
+
+
+def ensure_shopify_connection(
+    outputs_dir: Path,
+    *,
+    env_path: Path | None = None,
+) -> ShopifyConnectionState:
+    """
+    Load .env credentials, obtain/refresh token, and ping Shopify.
+    Called on every app load so connection status is never ambiguous.
+    """
+    env = load_shopify_env(env_path=env_path)
+    missing = _missing_shopify_env_vars(env)
+    if missing:
+        return ShopifyConnectionState(
+            connected=False,
+            shop_domain=env.shop_domain,
+            error="Set required variables in .env (see .env.example).",
+            missing_env=missing,
+        )
+    try:
+        client = shopify_client_from_env(outputs_dir, env_path=env_path)
+        if client is None:
+            return ShopifyConnectionState(
+                connected=False,
+                shop_domain=env.shop_domain,
+                error="Shopify client could not be created from .env.",
+                missing_env=missing,
+            )
+        shop_name = client.ping()
+        return ShopifyConnectionState(
+            connected=True,
+            client=client,
+            shop_name=str(shop_name or env.shop_domain),
+            shop_domain=env.shop_domain,
+        )
+    except Exception as e:
+        return ShopifyConnectionState(
+            connected=False,
+            shop_domain=env.shop_domain,
+            error=str(e),
+            missing_env=missing,
+        )

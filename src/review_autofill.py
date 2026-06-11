@@ -9,8 +9,29 @@ from src.media_workspace import SkuMediaIndex
 from src.review_store import ReviewStore
 from src.title_generator import generate_title_from_image
 from src.title_prompts import normalize_product_category
+from src.text_format import title_case_category
 from src.title_store import TitleStore
 from src.xlsx_ingest import index_by_sku, iter_rows
+
+DEFAULT_TITLE_MODEL = "models/gemini-3-flash-preview"
+
+
+def resolve_title_model(cfg, explicit: str | None = None) -> str:
+    """Pick a vision/text model — never the image-generation model from config.model."""
+    if explicit and "image" not in explicit.lower():
+        return explicit
+    for attr in ("title_model",):
+        base = getattr(cfg, "base", None)
+        for obj in (cfg, base):
+            if obj is None:
+                continue
+            val = str(getattr(obj, attr, "") or "").strip()
+            if val and "image" not in val.lower():
+                return val
+    env = (__import__("os").getenv("TITLE_MODEL") or "").strip()
+    if env and "image" not in env.lower():
+        return env
+    return DEFAULT_TITLE_MODEL
 
 
 def stock_row_for_sku(xlsx_path: Path, sku: str) -> dict[str, Any]:
@@ -74,13 +95,14 @@ def autofill_review_record(
     shop_prod: dict | None = None,
     title_store: TitleStore | None = None,
     stock_path: Path | None = None,
-    model: str = "models/gemini-2.5-flash",
+    model: str | None = None,
 ) -> dict[str, Any]:
     """
     Fill missing category from Stock.xlsx and missing title via generate_title_from_image.
     Persists to review_store (and title_store when a title is generated).
     """
     stock_path = stock_path or cfg.xlsx_path
+    model = resolve_title_model(cfg, model)
     outputs_dir = cfg.outputs_dir
     images_dir = getattr(cfg, "images_dir", None) or getattr(getattr(cfg, "base", None), "images_dir", Path("DAIJE"))
     cache_dir = getattr(cfg, "download_cache_dir", None) or getattr(getattr(cfg, "base", None), "download_cache_dir", outputs_dir / "_download_cache")
@@ -90,15 +112,20 @@ def autofill_review_record(
     updates: dict[str, Any] = {}
     messages: list[str] = []
 
-    category = str(rec.get("category") or rec.get("product_type") or "").strip()
+    category = title_case_category(str(rec.get("category") or rec.get("product_type") or ""))
     if not category:
-        category = str(stock_row.get("category") or "").strip()
+        category = title_case_category(str(stock_row.get("category") or ""))
         if not category and shop_prod:
-            category = str(shop_prod.get("product_type") or shop_prod.get("category") or "").strip()
+            category = title_case_category(
+                str(shop_prod.get("product_type") or shop_prod.get("category") or "")
+            )
         if category:
             updates["category"] = category
             updates["product_type"] = category
             messages.append("category from stock sheet")
+    elif category != str(rec.get("category") or rec.get("product_type") or "").strip():
+        updates["category"] = category
+        updates["product_type"] = category
 
     title = _title_from_stores(
         sku=sku,
@@ -155,6 +182,6 @@ def autofill_review_record(
     return {
         "updated": bool(updates),
         "title": title or str(review_store.get_record(sku).get("title") or "").strip(),
-        "category": category or str(review_store.get_record(sku).get("category") or "").strip(),
+        "category": category or title_case_category(str(review_store.get_record(sku).get("category") or "")),
         "messages": messages,
     }

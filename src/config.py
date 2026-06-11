@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ class AppConfig:
     missing_images_report: Path
     cost_log_csv: Path
     model: str
+    title_model: str
     pricing_usd_per_million_tokens: dict
     max_attempts_per_sku: int
     max_total_generations: int
@@ -40,6 +42,15 @@ class AppConfig:
 
 def _p(value: str) -> Path:
     return Path(value).expanduser().resolve() if value else Path(value)
+
+
+def resolve_image_model(raw: str | None = None) -> str:
+    """Image-generation model; IMAGE_MODEL env overrides config.yaml."""
+    env = (os.getenv("IMAGE_MODEL") or "").strip()
+    if env:
+        return env
+    m = (raw or "").strip()
+    return m or "models/gemini-3.1-flash-image-preview"
 
 
 def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
@@ -69,7 +80,10 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
         state_path=_p(str(get("state_path", "outputs/state.json"))),
         missing_images_report=_p(str(get("missing_images_report", "outputs/missing_local_images.csv"))),
         cost_log_csv=_p(str(get("cost_log_csv", "outputs/cost_log.csv"))),
-        model=str(get("model", "gemini-2.5-flash-image")),
+        model=resolve_image_model(str(get("model", "models/gemini-3.1-flash-image-preview"))),
+        title_model=str(
+            get("title_model", os.getenv("TITLE_MODEL") or "models/gemini-3-flash-preview")
+        ),
         pricing_usd_per_million_tokens=dict(get("pricing_usd_per_million_tokens", {}) or {}),
         max_attempts_per_sku=int(get("max_attempts_per_sku", 25)),
         max_total_generations=int(get("max_total_generations", 0)),

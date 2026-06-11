@@ -25,6 +25,8 @@ from src.pipeline import (
     load_entries_and_state,
     prepare_work_item_for_path,
     prepare_work_item_for_paths,
+    prepare_work_item_for_sku,
+    reference_paths_for_sku,
     prepare_work_item_from_url,
 )
 from src.media_workspace import index_sku_media, organize_sku_from_source, refresh_manifest
@@ -1489,15 +1491,15 @@ def _render_shopify_review(cfg) -> None:
                     st.caption(f"+{len(media) - 4} more on Shopify")
 
             gen_cols = st.columns(2)
-            ref_path = media_idx.raw_images[0] if media_idx.raw_images else None
-            if ref_path is None:
-                refs = _list_candidates_for_key(cfg.images_dir, primary_sku)
-                ref_path = refs[0] if refs else None
+            ref_paths = reference_paths_for_sku(cfg, primary_sku)
+            if not ref_paths:
+                ref_paths = _list_candidates_for_key(cfg.images_dir, primary_sku)
+            st.caption(f"Reference images for generation: {len(ref_paths)}")
 
             with gen_cols[0]:
-                if st.button("Regenerate prompt1", key=f"gen_p1::{form_key}", disabled=ref_path is None):
+                if st.button("Regenerate prompt1", key=f"gen_p1::{form_key}", disabled=not ref_paths):
                     try:
-                        work = prepare_work_item_for_path(cfg, primary_sku, ref_path)
+                        work = prepare_work_item_for_sku(cfg, primary_sku)
                         extra = f"Product title: {edit_title}\nCategory: {edit_category}"
                         with st.spinner("Generating prompt1..."):
                             out_path, _meta = generate_to_workspace(
@@ -1520,9 +1522,9 @@ def _render_shopify_review(cfg) -> None:
                         st.error("prompt1 generation failed.")
                         st.exception(e)
             with gen_cols[1]:
-                if st.button("Regenerate prompt2", key=f"gen_p2::{form_key}", disabled=ref_path is None):
+                if st.button("Regenerate prompt2", key=f"gen_p2::{form_key}", disabled=not ref_paths):
                     try:
-                        work = prepare_work_item_for_path(cfg, primary_sku, ref_path)
+                        work = prepare_work_item_for_sku(cfg, primary_sku)
                         extra = f"Product title: {edit_title}\nCategory: {edit_category}"
                         with st.spinner("Generating prompt2..."):
                             out_path, _meta = generate_to_workspace(

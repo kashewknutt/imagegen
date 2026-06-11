@@ -7,9 +7,11 @@ import os
 import socket
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import streamlit as st
+from google.genai import errors as genai_errors
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,8 @@ from src.drive_outputs_sync import DriveOutputsSync
 from src.drive_review_config import DriveReviewConfig, load_drive_review_config
 from src.drive_stock_sync import rebuild_and_replace, refresh_stock_sheet, resolve_stock_path
 from src.drive_sync_orchestrator import (
+    check_save_everything_media,
+    sku_ready_to_save,
     sync_after_regenerate,
     sync_save_everything,
     validate_local_workspace,
@@ -39,14 +43,22 @@ from src.firestore_leases import FirestoreLeaseManager
 from src.genai_client import GenAiImageClient
 from src.media_workspace import index_sku_media, refresh_manifest
 from src.name_group import base_key_from_path
-from src.pipeline import PROMPT_1, PROMPT_2, generate_to_workspace, prepare_work_item_for_path
+from src.pipeline import (
+    PROMPT_1,
+    PROMPT_2,
+    generate_to_workspace,
+    prepare_work_item_for_sku,
+    reference_paths_for_sku,
+)
 from src.review_autofill import autofill_review_record
 from src.review_store import ReviewStore
 from src.title_store import TitleStore
 from src.drive_outputs_tally import tally_drive_vs_local, write_tally_report
 from src.shopify_client import ShopifyClient
-from src.shopify_env import load_shopify_env, shopify_client_from_env
+from src.shopify_env import ShopifyConnectionState, ensure_shopify_connection, load_shopify_env
+from src.shopify_product_dedup import lookup_shopify_product, shopify_products_by_sku
 from src.shopify_media_sync import images_for_sku, media_paths_for_sku
+from src.text_format import product_generation_context, title_case_category
 from src.typo_sku_cleanup import write_audit_report
 from src.xlsx_ingest import index_by_sku, iter_rows
 
@@ -142,7 +154,6 @@ def _ensure_review_autofill(
             shop_prod=shop_prod,
             title_store=title_store,
             stock_path=stock_path,
-            model=cfg.base.model,
         )
     st.session_state[key] = result
     if result.get("updated"):
@@ -150,34 +161,95 @@ def _ensure_review_autofill(
 
 
 def _ensure_genai(cfg: DriveReviewConfig) -> GenAiImageClient:
-    if "genai_client" not in st.session_state:
-        st.session_state.genai_client = GenAiImageClient(
-            model=cfg.base.model,
+    model = cfg.base.model
+    key = f"genai_client::{model}"
+    if key not in st.session_state:
+        st.session_state[key] = GenAiImageClient(
+            model=model,
             min_seconds_between_requests=cfg.base.min_seconds_between_requests,
+            semaphore_dir=str(cfg.outputs_dir / "_semaphore"),
+            max_inflight_generations=cfg.base.max_inflight_generations,
         )
-    return st.session_state.genai_client
+    return st.session_state[key]
 
 
-def _shopify_sidebar(cfg: DriveReviewConfig) -> ShopifyClient | None:
+@dataclass
+class _ShopifySession:
+    connection: ShopifyConnectionState
+    products_by_sku: dict[str, dict]
+
+    @property
+    def client(self) -> ShopifyClient | None:
+        return self.connection.client
+
+
+def _load_shopify_product_index(
+    client: ShopifyClient,
+    *,
+    review_store: ReviewStore | None = None,
+) -> dict[str, dict]:
+    return shopify_products_by_sku(client, active_only=False, review_store=review_store)
+
+
+def _ensure_shopify_session(cfg: DriveReviewConfig, *, force_index: bool = False) -> _ShopifySession:
+    """Auto-connect from .env and ping Shopify on every run."""
+    env_path = ROOT / ".env"
+    conn = ensure_shopify_connection(cfg.outputs_dir, env_path=env_path)
+    st.session_state["shopify_connection"] = conn
+
+    products_by_sku: dict[str, dict] = {}
+    if conn.connected and conn.client:
+        index_key = "shopify_products_by_sku"
+        if force_index or index_key not in st.session_state:
+            try:
+                products_by_sku = _load_shopify_product_index(
+                    conn.client,
+                    review_store=_review_store(cfg),
+                )
+                st.session_state[index_key] = products_by_sku
+                st.session_state["shopify_index_shop"] = conn.shop_domain
+            except Exception as e:
+                conn = ShopifyConnectionState(
+                    connected=False,
+                    shop_domain=conn.shop_domain,
+                    error=f"Product index failed: {e}",
+                )
+                st.session_state["shopify_connection"] = conn
+        elif st.session_state.get("shopify_index_shop") == conn.shop_domain:
+            products_by_sku = st.session_state.get(index_key) or {}
+        else:
+            products_by_sku = _load_shopify_product_index(
+                conn.client,
+                review_store=_review_store(cfg),
+            )
+            st.session_state[index_key] = products_by_sku
+            st.session_state["shopify_index_shop"] = conn.shop_domain
+
+    return _ShopifySession(connection=conn, products_by_sku=products_by_sku)
+
+
+def _shopify_sidebar(cfg: DriveReviewConfig, session: _ShopifySession) -> _ShopifySession:
     st.subheader("Shopify")
-    env = load_shopify_env()
-    if not env.configured:
-        st.warning("Set `SHOPIFY_*` variables in `.env` (see `.env.example`).")
-        return None
-    st.caption(f"Shop: `{env.shop_domain}`")
-    st.caption(f"API: `{env.api_version}`")
-    try:
-        client = shopify_client_from_env(cfg.outputs_dir)
-    except Exception as e:
-        st.error(str(e))
-        return None
-    if st.button("Test Shopify connection"):
-        try:
-            name = client.ping()
-            st.success(f"Connected: {name}")
-        except Exception as e:
-            st.error(str(e))
-    return client
+    conn = session.connection
+    env = load_shopify_env(env_path=ROOT / ".env")
+
+    if conn.connected:
+        st.success(conn.status_label)
+        st.caption(f"Shop domain: `{conn.shop_domain}` | API: `{env.api_version}`")
+        st.caption(f"Products indexed: **{len(session.products_by_sku)}** SKUs")
+    elif conn.missing_env:
+        st.error(conn.status_label)
+        for var in conn.missing_env:
+            st.caption(f"• Missing `{var}` in `.env`")
+    else:
+        st.error(conn.status_label)
+
+    if st.button("Refresh Shopify connection + index"):
+        st.session_state.pop("shopify_products_by_sku", None)
+        st.session_state.pop("shopify_index_shop", None)
+        st.rerun()
+
+    return session
 
 
 def _drive_sidebar(cfg: DriveReviewConfig):
@@ -231,18 +303,6 @@ def _list_candidates(images_dir: Path, sku: str) -> list[Path]:
     return out
 
 
-def _shopify_product_for_sku(client: ShopifyClient, sku: str) -> dict | None:
-    try:
-        result = client.list_products(first=5, query=f"sku:{sku}")
-        for prod in result.get("products") or []:
-            skus = prod.get("skus") or []
-            if sku in skus or str(prod.get("sku") or "") == sku:
-                return prod
-    except Exception:
-        return None
-    return None
-
-
 def _acquire_next_sku(
     cfg: DriveReviewConfig,
     sync: DriveOutputsSync,
@@ -250,6 +310,7 @@ def _acquire_next_sku(
     *,
     skus: list[str],
     filter_status: set[str] | None = None,
+    ready_to_save_only: bool = False,
 ) -> str | None:
     review_store = _review_store(cfg)
     holder = _session_holder_id()
@@ -260,13 +321,63 @@ def _acquire_next_sku(
         status = str(rec.get("review_status") or "pending_review")
         if filter_status and status not in filter_status:
             continue
+        if ready_to_save_only and not sku_ready_to_save(cfg, sku, review_store=review_store):
+            continue
         if leases is None:
+            return sku
+        current = leases.get(sku)
+        if current and current.holder_id != holder:
+            continue
+        if current and current.holder_id == holder:
             return sku
         lease = leases.try_acquire(sku, holder_id=holder, machine_id=machine, tab_id=tab)
         if lease:
-            st.session_state.leased_sku = sku
             return sku
     return None
+
+
+def _select_next_open_sku(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    leases: FirestoreLeaseManager | None,
+    *,
+    skus: list[str],
+    exclude: str | None = None,
+) -> str | None:
+    """First SKU ready to save (both prompts, open status), optionally skipping one."""
+    if exclude and exclude in skus:
+        idx = skus.index(exclude)
+        candidates = [s for s in skus[idx + 1 :] + skus[:idx] if s != exclude]
+    else:
+        candidates = list(skus)
+    return _acquire_next_sku(
+        cfg,
+        sync,
+        leases,
+        skus=candidates,
+        filter_status=None,
+        ready_to_save_only=True,
+    )
+
+
+def _advance_after_save(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    leases: FirestoreLeaseManager | None,
+    *,
+    skus: list[str],
+    saved_sku: str,
+) -> str | None:
+    holder = _session_holder_id()
+    if leases:
+        leases.release(saved_sku, holder)
+    next_sku = _select_next_open_sku(cfg, sync, leases, skus=skus, exclude=saved_sku)
+    if next_sku and next_sku != saved_sku:
+        st.session_state.leased_sku = next_sku
+    else:
+        st.session_state.pop("leased_sku", None)
+        next_sku = None
+    return next_sku
 
 
 def _progress_callback(progress_bar, status_text):
@@ -327,8 +438,9 @@ def _render_review_sku(
     service,
     *,
     sku: str,
-    shopify_client: ShopifyClient | None,
+    shopify: _ShopifySession,
     leases: FirestoreLeaseManager | None,
+    queue_skus: list[str],
 ) -> None:
     review_store = _review_store(cfg)
     holder = _session_holder_id()
@@ -348,7 +460,11 @@ def _render_review_sku(
     sync.sync_review_state_local()
 
     media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=sku)
-    shop_prod = _shopify_product_for_sku(shopify_client, sku) if shopify_client else None
+    shop_prod, shop_lookup_msg = lookup_shopify_product(
+        shopify.products_by_sku,
+        sku,
+        review_store=review_store,
+    )
     _ensure_review_autofill(cfg, service, sku=sku, review_store=review_store, media_idx=media_idx, shop_prod=shop_prod)
 
     rec = review_store.get_record(sku)
@@ -359,7 +475,7 @@ def _render_review_sku(
         or str(title_rec.get("new_title") or title_rec.get("generated_title") or "").strip()
         or str((shop_prod or {}).get("title") or "").strip()
     )
-    default_category = (
+    default_category = title_case_category(
         str(rec.get("category") or rec.get("product_type") or "").strip()
         or str((shop_prod or {}).get("product_type") or (shop_prod or {}).get("category") or "").strip()
     )
@@ -371,10 +487,16 @@ def _render_review_sku(
     st.markdown(f"### {sku}")
     st.caption(f"Review: `{status}`")
     product_id = str(rec.get("product_id") or (shop_prod or {}).get("id") or "")
-    if shop_prod:
-        st.caption(f"On Shopify: `{shop_prod.get('title')}` ({product_id})")
+    conn = shopify.connection
+    if not conn.connected:
+        st.error(f"**Shopify not connected** — {conn.error or conn.status_label}")
+        if conn.missing_env:
+            st.caption("Add the missing variables to `.env` and click **Refresh Shopify connection + index**.")
+    elif shop_prod:
+        st.success(f"**Shopify connected** — `{shop_prod.get('title')}` (`{product_id}`)")
     else:
-        st.caption("Not found on Shopify (or not connected).")
+        st.warning(f"**Shopify connected** ({conn.shop_name}) — {shop_lookup_msg}")
+        st.caption("Drive + Sheet will still save; Shopify media sync needs a product with this SKU on Shopify.")
 
     cols = st.columns(4)
     with cols[0]:
@@ -400,49 +522,97 @@ def _render_review_sku(
     prompt1_text = st.text_area("Prompt1", value=str(rec.get("prompt1_text") or PROMPT_1), height=120, key=f"p1text::{sku}")
     prompt2_text = st.text_area("Prompt2", value=str(rec.get("prompt2_text") or PROMPT_2), height=120, key=f"p2text::{sku}")
 
-    ref_path = media_idx.raw_images[0] if media_idx.raw_images else None
-    if ref_path is None:
-        refs = _list_candidates(cfg.base.images_dir, sku)
-        ref_path = refs[0] if refs else None
+    ref_paths = reference_paths_for_sku(cfg.base, sku)
+    if not ref_paths:
+        ref_paths = _list_candidates(cfg.base.images_dir, sku)
 
     gen = _ensure_genai(cfg)
+    st.caption(
+        f"Image model: `{cfg.base.model}` | "
+        f"Reference images for generation: **{len(ref_paths)}**"
+        + (f" (`{', '.join(p.name for p in ref_paths[:4])}`"
+           + (f" +{len(ref_paths) - 4} more" if len(ref_paths) > 4 else "")
+           + ")" if ref_paths else " (none)")
+    )
+    gen_ctx = product_generation_context(title=title, category=category)
     has_both_prompts = bool(media_idx.prompt1_versions and media_idx.prompt2_versions)
+    upload_paths = media_paths_for_sku(cfg.base, sku, review_store=review_store)
+    has_raw = bool(upload_paths["raw"])
+    can_save = has_both_prompts and has_raw
+    readiness = check_save_everything_media(
+        cfg, sync, sku, review_store=review_store, shop_prod=shop_prod,
+    )
+    with st.expander("Save readiness (generated + raw + videos)", expanded=not can_save):
+        loc = readiness.get("local") or {}
+        st.write(
+            {
+                "prompt1": loc.get("has_prompt1"),
+                "prompt2": loc.get("has_prompt2"),
+                "raw": loc.get("has_raw"),
+                "videos": loc.get("has_videos"),
+                "shopify_images_to_upload": loc.get("upload_image_count"),
+                "shopify_videos_to_upload": loc.get("video_count"),
+            }
+        )
+        shop_before = readiness.get("shopify_before") or {}
+        if shop_before.get("connected"):
+            st.caption(
+                f"Shopify now: {shop_before.get('image_count', 0)} image(s), "
+                f"{shop_before.get('video_count', 0)} video(s)"
+            )
+        if readiness.get("warnings"):
+            for w in readiness["warnings"]:
+                st.caption(f"Note: {w}")
     g1, g2 = st.columns(2)
+    def _regenerate_prompt(*, slot: str, prompt_text: str) -> None:
+        try:
+            work = prepare_work_item_for_sku(cfg.base, sku)
+            out_path, _ = generate_to_workspace(
+                cfg.base,
+                gen,
+                work,
+                prompt_slot=slot,
+                prompt_override=prompt_text,
+                extra_context=gen_ctx,
+            )
+            result = sync_after_regenerate(cfg, sync, service, sku, prompt_slot=slot, review_store=review_store)
+            st.success(f"Saved {out_path.name}")
+            st.json(result)
+            st.rerun()
+        except genai_errors.ClientError as exc:
+            code = getattr(exc, "status_code", None)
+            if code == 429:
+                st.error(
+                    f"Gemini quota exceeded for `{cfg.base.model}`. "
+                    "Enable billing on your Google AI project or set `IMAGE_MODEL` in `.env` to a model your key supports. "
+                    "The client will retry automatically, but free-tier image models often have limit 0."
+                )
+            else:
+                st.error(f"Gemini API error ({code}): {exc}")
+        except Exception as exc:
+            st.error(f"Generation failed: {exc}")
+
     with g1:
-        if st.button("Regenerate prompt1", disabled=ref_path is None, key=f"rp1::{sku}"):
-            work = prepare_work_item_for_path(cfg.base, sku, ref_path)
-            out_path, _ = generate_to_workspace(
-                cfg.base, gen, work, prompt_slot="prompt1", prompt_override=prompt1_text,
-                extra_context=f"Title: {title}\nCategory: {category}",
-            )
-            result = sync_after_regenerate(cfg, sync, service, sku, prompt_slot="prompt1", review_store=review_store)
-            st.success(f"Saved {out_path.name}")
-            st.json(result)
-            st.rerun()
+        if st.button("Regenerate prompt1", disabled=not ref_paths, key=f"rp1::{sku}"):
+            _regenerate_prompt(slot="prompt1", prompt_text=prompt1_text)
     with g2:
-        if st.button("Regenerate prompt2", disabled=ref_path is None, key=f"rp2::{sku}"):
-            work = prepare_work_item_for_path(cfg.base, sku, ref_path)
-            out_path, _ = generate_to_workspace(
-                cfg.base, gen, work, prompt_slot="prompt2", prompt_override=prompt2_text,
-                extra_context=f"Title: {title}\nCategory: {category}",
-            )
-            result = sync_after_regenerate(cfg, sync, service, sku, prompt_slot="prompt2", review_store=review_store)
-            st.success(f"Saved {out_path.name}")
-            st.json(result)
-            st.rerun()
+        if st.button("Regenerate prompt2", disabled=not ref_paths, key=f"rp2::{sku}"):
+            _regenerate_prompt(slot="prompt2", prompt_text=prompt2_text)
 
     save_help = (
-        "Saves title/category/description/tags; uploads latest prompt1+prompt2 to Drive + Sheet. "
-        "Skips raw/video on Drive if already there. Shopify gets generated images only."
+        "Validates prompt1, prompt2, raw images, and videos; pushes full workspace to Drive + Sheet. "
+        "Skips raw/video on Drive if already there. Shopify gets prompt1+prompt2+raw+videos."
     )
-    if shopify_client and product_id:
-        save_help += " Replaces Shopify product images with latest prompt1+prompt2."
-    elif shopify_client:
-        save_help += " (Shopify skipped — no product linked yet)"
+    if conn.connected and product_id:
+        save_help += " Replaces Shopify media with the full local set."
+    elif conn.connected:
+        save_help += " (Shopify skipped — no product with this SKU on Shopify yet)"
+    elif not conn.connected:
+        save_help += " (Shopify skipped — not connected)"
     if st.button(
         "Save everything",
         type="primary",
-        disabled=not has_both_prompts,
+        disabled=not can_save,
         key=f"save_all::{sku}",
         help=save_help,
     ):
@@ -460,38 +630,72 @@ def _render_review_sku(
                 prompt2_text=prompt2_text,
                 product_id=product_id,
                 handle=str(rec.get("handle") or (shop_prod or {}).get("handle") or ""),
-                shopify_client=shopify_client,
+                shopify_client=shopify.client,
                 shop_prod=shop_prod,
                 review_store=review_store,
             )
-        media_check = (result.drive_push or {}).get("media_check") or {}
+        if not (result.media_readiness or {}).get("ready"):
+            st.error("Save blocked — fix missing media first.")
+            for err in result.errors:
+                st.caption(f"• {err}")
+            st.json({"media_readiness": result.media_readiness, "errors": result.errors})
+            return
+        post = (result.drive_push or {}).get("post_push") or {}
         skipped = (result.drive_push or {}).get("skipped_existing_raw_videos") or []
-        if media_check:
+        if post:
             st.caption(
-                f"Drive check — videos: {len(media_check.get('videos_on_drive') or [])}/"
-                f"{len(media_check.get('local_videos') or [])} on Drive, "
-                f"raw: {len(media_check.get('raw_on_drive') or [])}/"
-                f"{len(media_check.get('local_raw') or [])} on Drive"
+                f"Drive — prompt1: {post.get('has_prompt1')}, prompt2: {post.get('has_prompt2')}, "
+                f"raw: {len(post.get('raw_on_drive') or [])} on Drive, "
+                f"videos: {len(post.get('videos_on_drive') or [])} on Drive"
                 + (f" (skipped {len(skipped)} upload(s))" if skipped else "")
             )
+        if result.shopify:
+            st.caption(
+                f"Shopify — images: {result.shopify.get('image_count', 0)}/"
+                f"{result.shopify.get('expected_images', '?')}, "
+                f"videos: {result.shopify.get('video_count', 0)}/"
+                f"{result.shopify.get('expected_videos', 0)}"
+            )
+        if result.warnings:
+            for w in result.warnings:
+                st.caption(f"Note: {w}")
         if result.errors:
             st.warning("Saved with warnings:")
             for err in result.errors:
                 st.caption(f"• {err}")
         else:
             st.success("Saved everything — Drive, Google Sheet" + (", and Shopify" if result.shopify else "."))
+        final_status = str(_review_store(cfg).get_record(sku).get("review_status") or "")
+        if final_status == "uploaded":
+            next_sku = _advance_after_save(cfg, sync, leases, skus=queue_skus, saved_sku=sku)
+            if next_sku:
+                st.info(f"Next open SKU: `{next_sku}`")
+            else:
+                st.info("No more open SKUs ready to save.")
+        else:
+            st.warning(
+                f"SKU `{sku}` is still `{final_status}` — Drive save may have failed. "
+                "Fix errors above and save again."
+            )
         st.json(
             {
+                "media_readiness": result.media_readiness,
                 "drive_push": result.drive_push,
                 "review_state_pushed": result.review_state_pushed,
                 "xlsx_replaced": result.xlsx_replaced,
                 "shopify": result.shopify,
+                "warnings": result.warnings,
                 "errors": result.errors,
             }
         )
         st.rerun()
-    if not has_both_prompts:
-        st.caption("Generate both prompt1 and prompt2 before Save everything.")
+    if not can_save:
+        missing = []
+        if not has_both_prompts:
+            missing.append("prompt1 and prompt2")
+        if not has_raw:
+            missing.append("raw/reference images")
+        st.caption(f"Need {', '.join(missing)} before Save everything.")
 
     v1, v2, v3 = st.columns(3)
     with v1:
@@ -517,7 +721,7 @@ def _render_review_sku(
         st.write({"images": len(imgs), "videos": len(paths.get("videos") or [])})
 
 
-def _render_review_queue(cfg: DriveReviewConfig, sync: DriveOutputsSync, service, shopify_client, leases) -> None:
+def _render_review_queue(cfg: DriveReviewConfig, sync: DriveOutputsSync, service, shopify: _ShopifySession, leases) -> None:
     st.subheader("Review Queue")
     skus = sync.list_local_sku_dirs()
     review_store = _review_store(cfg)
@@ -552,12 +756,14 @@ def _render_review_queue(cfg: DriveReviewConfig, sync: DriveOutputsSync, service
             want = {"pending_review", "failed"} if status_filter in {"ALL", "pending_review"} else {status_filter}
             if status_filter == "ALL":
                 want = None
-            sku = _acquire_next_sku(cfg, sync, leases, skus=filtered, filter_status=want)
+            sku = _acquire_next_sku(
+                cfg, sync, leases, skus=filtered, filter_status=want, ready_to_save_only=True,
+            )
             if sku:
                 st.session_state.leased_sku = sku
                 st.rerun()
             else:
-                st.warning("No available SKU to lease.")
+                st.warning("No available SKU ready to save.")
     with c2:
         if st.button("Refresh folder list"):
             st.rerun()
@@ -574,10 +780,45 @@ def _render_review_queue(cfg: DriveReviewConfig, sync: DriveOutputsSync, service
                 width="stretch",
             )
 
-    pick = st.selectbox("Open SKU", [""] + filtered, index=0)
+    leased = st.session_state.get("leased_sku")
+    if leased and not sku_ready_to_save(cfg, leased):
+        if leases:
+            leases.release(leased, _session_holder_id())
+        leased = None
+        st.session_state.pop("leased_sku", None)
+    if not leased:
+        auto = _select_next_open_sku(cfg, sync, leases, skus=filtered)
+        if auto:
+            st.session_state.leased_sku = auto
+
+    options = [""] + filtered
+    leased = st.session_state.get("leased_sku")
+    pick_idx = options.index(leased) if leased in options else 0
+    if leased and leased not in filtered:
+        st.caption(f"Showing `{leased}` (status no longer matches filter). Change filter to ALL to see it in the list.")
+    pick = st.selectbox("Open SKU", options, index=pick_idx)
+    if pick:
+        if pick != leased:
+            st.session_state.leased_sku = pick
+            if leases:
+                holder = _session_holder_id()
+                leases.try_acquire(
+                    pick,
+                    holder_id=holder,
+                    machine_id=cfg.machine_id or _machine_id(),
+                    tab_id=_tab_id(),
+                )
     sku = st.session_state.get("leased_sku") or (pick if pick else None)
     if sku:
-        _render_review_sku(cfg, sync, service, sku=sku, shopify_client=shopify_client, leases=leases)
+        _render_review_sku(
+            cfg,
+            sync,
+            service,
+            sku=sku,
+            shopify=shopify,
+            leases=leases,
+            queue_skus=skus,
+        )
 
 
 def main() -> None:
@@ -593,10 +834,12 @@ def main() -> None:
     cfg.outputs_dir.mkdir(parents=True, exist_ok=True)
     cfg.drive_credentials_dir.mkdir(parents=True, exist_ok=True)
 
+    shopify_session = _ensure_shopify_session(cfg)
+
     with st.sidebar:
         _drive_sidebar(cfg)
         st.divider()
-        shopify_client = _shopify_sidebar(cfg)
+        shopify_session = _shopify_sidebar(cfg, shopify_session)
         st.divider()
         st.subheader("Firestore")
         st.caption(f"Project: `{cfg.firestore_project_id or '(not set)'}`")
@@ -622,7 +865,7 @@ def main() -> None:
     with tab_cleanup:
         _render_cleanup(cfg, sync, service)
     with tab_review:
-        _render_review_queue(cfg, sync, service, shopify_client, leases)
+        _render_review_queue(cfg, sync, service, shopify_session, leases)
     with tab_tools:
         st.subheader("Tools")
         st.caption(
@@ -642,7 +885,7 @@ def main() -> None:
                 tally = tally_drive_vs_local(
                     cfg,
                     sync,
-                    shopify_client=shopify_client,
+                    shopify_client=shopify_session.client,
                     progress=_progress_callback(progress, status),
                 )
                 json_path, md_path = write_tally_report(tally, cfg.outputs_dir)
