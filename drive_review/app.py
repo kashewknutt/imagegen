@@ -86,6 +86,7 @@ GALLERY_PULL_KEY = "gallery_pull_key"
 GALLERY_DRIVE_META_CACHE = "gallery_drive_meta_cache"
 GALLERY_COMPLETE_SKUS = "gallery_complete_skus"
 GALLERY_COMPLETE_CACHE_KEY = "gallery_complete_cache_key"
+GALLERY_ACTIVE_SEARCH_KEY = "gallery_active_search"
 
 
 def _safe_open(path: Path) -> Image.Image | None:
@@ -925,6 +926,244 @@ def _render_review_sku(
         st.write({"images": len(imgs), "videos": len(paths.get("videos") or [])})
 
 
+def _resolve_gallery_search_sku(
+    cfg: DriveReviewConfig,
+    query: str,
+    *,
+    enriched_index: dict,
+) -> str | None:
+    q = (query or "").strip()
+    if not q:
+        return None
+    if q in enriched_index:
+        return q
+    qu = q.upper()
+    for sku in enriched_index:
+        if sku.upper() == qu:
+            return sku
+    if (cfg.outputs_dir / qu).is_dir():
+        return qu
+    for p in cfg.outputs_dir.iterdir():
+        if p.is_dir() and p.name.upper() == qu:
+            return p.name
+    return None
+
+
+def _render_gallery_save_edited_footer(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    *,
+    page_skus: list[str],
+    shopify: _ShopifySession,
+    review_store: ReviewStore,
+) -> None:
+    edited_all = _gallery_edited()
+    edited_skus = {
+        sku: slots
+        for sku, slots in edited_all.items()
+        if any(slots.get(s) is not None for s in ("prompt1", "prompt2"))
+    }
+    page_edited = {sku: slots for sku, slots in edited_skus.items() if sku in page_skus}
+    st.divider()
+    st.subheader("Save edited on this page")
+    if page_edited:
+        st.caption(
+            f"**{len(page_edited)}** SKU(s) edited will upload only changed prompt images "
+            f"(Drive + Shopify replace; raw/videos skipped)."
+        )
+        for sku, slots in sorted(page_edited.items()):
+            parts = [f"{s} v{slots[s]}" for s in ("prompt1", "prompt2") if slots.get(s) is not None]
+            st.caption(f"• `{sku}` — {', '.join(parts)}")
+    else:
+        st.caption("No edits yet. Regenerate images above, then save here.")
+
+    save_col1, save_col2 = st.columns([1, 2])
+    with save_col1:
+        if st.button(
+            f"Save edited ({len(page_edited)})",
+            type="primary",
+            key="gallery_save_edited_page",
+            disabled=not page_edited,
+        ):
+            with st.spinner(f"Saving {len(page_edited)} edited SKU(s)..."):
+                results = sync_gallery_batch_save(
+                    cfg,
+                    sync,
+                    edited=page_edited,
+                    shopify_client=shopify.client if shopify.connected else None,
+                    products_by_sku=shopify.products_by_sku,
+                    review_store=review_store,
+                )
+            ok = err = 0
+            for result in results:
+                if result.errors:
+                    err += 1
+                    st.warning(f"`{result.sku}`: {', '.join(result.errors)}")
+                else:
+                    ok += 1
+            if ok:
+                st.success(f"Saved {ok} SKU(s) — prompt images only.")
+            for sku in page_edited:
+                rec = edited_all.get(sku) or {}
+                rec["prompt1"] = None
+                rec["prompt2"] = None
+                if not any(rec.get(s) is not None for s in ("prompt1", "prompt2")):
+                    edited_all.pop(sku, None)
+            st.session_state[GALLERY_EDITED_KEY] = edited_all
+            st.session_state.pop(GALLERY_DRIVE_META_CACHE, None)
+            st.rerun()
+    with save_col2:
+        session_edited_count = len(edited_skus)
+        if session_edited_count > len(page_edited):
+            st.caption(
+                f"**{session_edited_count - len(page_edited)}** more edited SKU(s) elsewhere — "
+                "navigate there to save them."
+            )
+
+
+def _render_gallery_media_sections(media_idx, *, compact: bool = False) -> None:
+    """Show latest generated, all raw images, and videos for a SKU."""
+
+    def _section(title: str) -> None:
+        if compact:
+            st.markdown(f"**{title}**")
+        else:
+            st.subheader(title)
+
+    _section("Generated (latest)")
+    g1, g2 = st.columns(2)
+    with g1:
+        if media_idx.latest_prompt1:
+            ver = media_idx.prompt1_versions[-1][0]
+            st.image(_safe_open(media_idx.latest_prompt1), caption=f"prompt1 v{ver}", width="stretch")
+        else:
+            st.caption("No prompt1 generated.")
+    with g2:
+        if media_idx.latest_prompt2:
+            ver = media_idx.prompt2_versions[-1][0]
+            st.image(_safe_open(media_idx.latest_prompt2), caption=f"prompt2 v{ver}", width="stretch")
+        else:
+            st.caption("No prompt2 generated.")
+
+    _section(f"Raw images ({len(media_idx.raw_images)})")
+    if media_idx.raw_images:
+        ncol = min(3 if compact else 4, len(media_idx.raw_images))
+        raw_cols = st.columns(ncol)
+        for i, raw_path in enumerate(media_idx.raw_images):
+            with raw_cols[i % ncol]:
+                st.image(_safe_open(raw_path), caption=raw_path.name, width="stretch")
+    else:
+        st.caption("No raw images in local workspace.")
+
+    _section(f"Videos ({len(media_idx.videos)})")
+    if media_idx.videos:
+        for vid_path in media_idx.videos:
+            st.video(str(vid_path))
+            st.caption(vid_path.name)
+    else:
+        st.caption("No videos in local workspace.")
+
+
+def _render_gallery_sku_detail(
+    cfg: DriveReviewConfig,
+    sync: DriveOutputsSync,
+    service,
+    *,
+    sku: str,
+    enriched_index: dict,
+    drive_folders: dict[str, str],
+    shopify: _ShopifySession,
+    review_store: ReviewStore,
+) -> None:
+    pull_key = f"search:{sku}"
+    _pull_gallery_page_from_drive(
+        cfg, sync, page_skus=[sku], drive_folders=drive_folders, pull_key=pull_key,
+    )
+    media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=sku)
+    shop_prod, _ = lookup_shopify_product(shopify.products_by_sku, sku, review_store=review_store)
+    review_rec = review_store.get_record(sku)
+    drive_meta = scan_drive_metadata_for_skus(sync, [sku], drive_folders=drive_folders).get(sku) or {}
+    enriched_row = enriched_index.get(sku) or {}
+    readiness = gallery_readiness_light(
+        media_idx=media_idx,
+        drive_meta=drive_meta,
+        shop_prod=shop_prod,
+    )
+    row = build_gallery_row(
+        sku,
+        cfg=cfg,
+        enriched_row=enriched_row,
+        media_idx=media_idx,
+        drive_meta=drive_meta,
+        shop_prod=shop_prod,
+        review_rec=review_rec,
+        readiness=readiness,
+        drive_folders=set(drive_folders.keys()),
+    )
+    ref_paths = reference_paths_for_sku(cfg.base, sku) or _list_candidates(cfg.base.images_dir, sku)
+
+    st.markdown(f"### `{sku}`")
+    if row.title:
+        st.caption(f"**{row.title}** · {row.category}")
+    if row.description:
+        st.caption(row.description)
+
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        st.caption(
+            f"**Local** raw {row.local_raw} · vid {row.local_videos} · "
+            f"p1 {'✓' if row.local_has_p1 else '✗'} · p2 {'✓' if row.local_has_p2 else '✗'}"
+        )
+    with s2:
+        st.caption(
+            f"**Drive** raw {row.drive_raw} · vid {row.drive_videos} · "
+            f"p1 {'✓' if row.drive_has_p1 else '✗'} · p2 {'✓' if row.drive_has_p2 else '✗'}"
+        )
+    with s3:
+        st.caption(
+            f"**Shopify** img {row.shopify_images} · vid {row.shopify_videos} · "
+            f"{'linked' if row.on_shopify else 'missing'}"
+        )
+    with s4:
+        edited = _gallery_edited().get(sku) or {}
+        edited_slots = [s for s in ("prompt1", "prompt2") if edited.get(s) is not None]
+        if edited_slots:
+            st.caption(f"**Edited** ({', '.join(edited_slots)})")
+        else:
+            st.caption(f"Review: `{row.review_status}`")
+
+    b1, b2 = st.columns(2)
+    rec = review_rec
+    title = row.title or str(rec.get("title") or "")
+    category = row.category or title_case_category(str(rec.get("category") or ""))
+    prompt1_text = str(rec.get("prompt1_text") or default_prompt_for_category(PROMPT_1, category))
+    prompt2_text = str(rec.get("prompt2_text") or default_prompt_for_category(PROMPT_2, category))
+    gen_ctx = product_generation_context(title=title, category=category)
+    with b1:
+        if st.button("Regen p1", key=f"gallery_search_rp1::{sku}", disabled=not ref_paths):
+            _regenerate_prompt_for_sku(
+                cfg, sync, service,
+                sku=sku, slot="prompt1", prompt_text=prompt1_text, gen_ctx=gen_ctx,
+                review_store=review_store, gallery_local_only=True,
+            )
+    with b2:
+        if st.button("Regen p2", key=f"gallery_search_rp2::{sku}", disabled=not ref_paths):
+            _regenerate_prompt_for_sku(
+                cfg, sync, service,
+                sku=sku, slot="prompt2", prompt_text=prompt2_text, gen_ctx=gen_ctx,
+                review_store=review_store, gallery_local_only=True,
+            )
+
+    regen_msg = st.session_state.pop(f"gallery_regen_msg::{sku}", None)
+    if regen_msg:
+        st.success(regen_msg)
+
+    _render_gallery_media_sections(media_idx, compact=False)
+
+    with st.expander("Details", expanded=False):
+        st.write(row.readiness)
+
+
 def _render_gallery_card(
     cfg: DriveReviewConfig,
     sync: DriveOutputsSync,
@@ -965,14 +1204,6 @@ def _render_gallery_card(
     if row.description:
         st.caption(row.description[:200] + ("…" if len(row.description) > 200 else ""))
 
-    img1, img2 = st.columns(2)
-    with img1:
-        if media_idx.latest_prompt1:
-            st.image(_safe_open(media_idx.latest_prompt1), caption="prompt1", width="stretch")
-    with img2:
-        if media_idx.latest_prompt2:
-            st.image(_safe_open(media_idx.latest_prompt2), caption="prompt2", width="stretch")
-
     s1, s2, s3, s4 = st.columns(4)
     with s1:
         st.caption(
@@ -1011,6 +1242,8 @@ def _render_gallery_card(
     regen_msg = st.session_state.pop(f"gallery_regen_msg::{sku}", None)
     if regen_msg:
         st.success(regen_msg)
+
+    _render_gallery_media_sections(media_idx, compact=True)
 
     with st.expander("Details", expanded=False):
         st.write(row.readiness)
@@ -1052,6 +1285,52 @@ def _render_gallery(
     all_complete = _cached_gallery_complete_skus(
         cfg, enriched_index, req_cols=req_cols, review_store=review_store,
     )
+
+    search_col1, search_col2, search_col3 = st.columns([3, 1, 1])
+    with search_col1:
+        search_query = st.text_input(
+            "Search SKU",
+            key="gallery_search_input",
+            placeholder="e.g. DIARFHW26074",
+        )
+    with search_col2:
+        search_clicked = st.button("Search", type="primary", key="gallery_search_btn")
+    with search_col3:
+        clear_search = st.button("Clear", key="gallery_search_clear")
+
+    if clear_search:
+        st.session_state.pop(GALLERY_ACTIVE_SEARCH_KEY, None)
+        st.session_state.pop("gallery_search_input", None)
+        st.session_state.pop(GALLERY_PULL_KEY, None)
+        st.rerun()
+
+    if search_clicked:
+        resolved = _resolve_gallery_search_sku(cfg, search_query, enriched_index=enriched_index)
+        if resolved:
+            st.session_state[GALLERY_ACTIVE_SEARCH_KEY] = resolved
+            st.session_state.pop(GALLERY_PULL_KEY, None)
+            st.rerun()
+        else:
+            st.session_state.pop(GALLERY_ACTIVE_SEARCH_KEY, None)
+            st.error(f"No SKU found for `{search_query.strip()}`")
+
+    active_search = st.session_state.get(GALLERY_ACTIVE_SEARCH_KEY)
+    if active_search:
+        if "gallery_drive_folders" not in st.session_state:
+            st.session_state["gallery_drive_folders"] = sync.list_sku_folders(refresh=False)
+        drive_folders = st.session_state["gallery_drive_folders"]
+        _render_gallery_sku_detail(
+            cfg, sync, service,
+            sku=active_search,
+            enriched_index=enriched_index,
+            drive_folders=drive_folders,
+            shopify=shopify,
+            review_store=review_store,
+        )
+        _render_gallery_save_edited_footer(
+            cfg, sync, page_skus=[active_search], shopify=shopify, review_store=review_store,
+        )
+        return
 
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1, 2])
     with ctrl1:
@@ -1099,8 +1378,7 @@ def _render_gallery(
         sync, page_skus=page_skus, drive_folders=drive_folders, cache_key=page_cache_key,
     )
 
-    cols = st.columns(2)
-    for i, sku in enumerate(page_skus):
+    for sku in page_skus:
         enriched_row = enriched_index.get(sku) or {}
         media_idx = index_sku_media(outputs_dir=cfg.outputs_dir, sku=sku)
         shop_prod, _ = lookup_shopify_product(shopify.products_by_sku, sku, review_store=review_store)
@@ -1122,75 +1400,19 @@ def _render_gallery(
             drive_folders=set(drive_folders.keys()),
         )
         ref_paths = reference_paths_for_sku(cfg.base, sku) or _list_candidates(cfg.base.images_dir, sku)
-        with cols[i % 2]:
-            with st.container(border=True):
-                _render_gallery_card(
-                    cfg, sync, service,
-                    row=row,
-                    media_idx=media_idx,
-                    shopify=shopify,
-                    review_store=review_store,
-                    ref_paths=ref_paths,
-                )
-
-    edited_all = _gallery_edited()
-    edited_skus = {sku: slots for sku, slots in edited_all.items() if any(slots.get(s) is not None for s in ("prompt1", "prompt2"))}
-    page_edited = {sku: slots for sku, slots in edited_skus.items() if sku in page_skus}
-    st.divider()
-    st.subheader("Save edited on this page")
-    if page_edited:
-        st.caption(
-            f"**{len(page_edited)}** SKU(s) edited on this page will upload only changed prompt images "
-            f"(Drive + Shopify replace; raw/videos skipped)."
-        )
-        for sku, slots in sorted(page_edited.items()):
-            parts = [f"{s} v{slots[s]}" for s in ("prompt1", "prompt2") if slots.get(s) is not None]
-            st.caption(f"• `{sku}` — {', '.join(parts)}")
-    else:
-        st.caption("No edits on this page yet. Regenerate images above, then save here.")
-
-    save_col1, save_col2 = st.columns([1, 2])
-    with save_col1:
-        if st.button(
-            f"Save edited ({len(page_edited)})",
-            type="primary",
-            key="gallery_save_edited_page",
-            disabled=not page_edited,
-        ):
-            with st.spinner(f"Saving {len(page_edited)} edited SKU(s)..."):
-                results = sync_gallery_batch_save(
-                    cfg,
-                    sync,
-                    edited=page_edited,
-                    shopify_client=shopify.client if shopify.connected else None,
-                    products_by_sku=shopify.products_by_sku,
-                    review_store=review_store,
-                )
-            ok = err = 0
-            for result in results:
-                if result.errors:
-                    err += 1
-                    st.warning(f"`{result.sku}`: {', '.join(result.errors)}")
-                else:
-                    ok += 1
-            if ok:
-                st.success(f"Saved {ok} SKU(s) — prompt images only.")
-            for sku in page_edited:
-                rec = edited_all.get(sku) or {}
-                rec["prompt1"] = None
-                rec["prompt2"] = None
-                if not any(rec.get(s) is not None for s in ("prompt1", "prompt2")):
-                    edited_all.pop(sku, None)
-            st.session_state[GALLERY_EDITED_KEY] = edited_all
-            st.session_state.pop(GALLERY_DRIVE_META_CACHE, None)
-            st.rerun()
-    with save_col2:
-        session_edited_count = len(edited_skus)
-        if session_edited_count > len(page_edited):
-            st.caption(
-                f"**{session_edited_count - len(page_edited)}** more edited SKU(s) on other pages — "
-                "navigate there to save them."
+        with st.container(border=True):
+            _render_gallery_card(
+                cfg, sync, service,
+                row=row,
+                media_idx=media_idx,
+                shopify=shopify,
+                review_store=review_store,
+                ref_paths=ref_paths,
             )
+
+    _render_gallery_save_edited_footer(
+        cfg, sync, page_skus=page_skus, shopify=shopify, review_store=review_store,
+    )
 
 
 def _render_review_queue(cfg: DriveReviewConfig, sync: DriveOutputsSync, service, shopify: _ShopifySession, leases) -> None:
