@@ -56,7 +56,7 @@ from src.drive_review_log import setup_drive_review_logging
 from src.drive_typo_cleanup import apply_drive_typo_cleanup, audit_drive_typo_folders
 from src.firestore_leases import FirestoreLeaseManager
 from src.genai_client import GenAiImageClient
-from src.media_workspace import index_sku_media, refresh_manifest
+from src.media_workspace import index_sku_media, raw_dir, refresh_manifest
 from src.name_group import base_key_from_path
 from src.pipeline import (
     PROMPT_1,
@@ -329,6 +329,23 @@ def _list_candidates(images_dir: Path, sku: str) -> list[Path]:
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS and base_key_from_path(p) == sku:
             out.append(p)
     return out
+
+
+def _save_uploaded_raw(cfg: DriveReviewConfig, sku: str, uploaded_file) -> Path:
+    """Write an uploaded file into outputs/{sku}/raw/ with the next sequential name."""
+    sku_dir = cfg.outputs_dir / sku
+    rd = raw_dir(sku_dir)
+    rd.mkdir(parents=True, exist_ok=True)
+    ext = Path(uploaded_file.name).suffix.lower() or ".jpg"
+    n = 1
+    while True:
+        dest = rd / f"raw_{n}{ext}"
+        if not dest.exists():
+            break
+        n += 1
+    dest.write_bytes(uploaded_file.getvalue())
+    refresh_manifest(outputs_dir=cfg.outputs_dir, sku=sku)
+    return dest
 
 
 def _acquire_next_sku(
@@ -1132,13 +1149,26 @@ def _render_gallery_sku_detail(
         else:
             st.caption(f"Review: `{row.review_status}`")
 
-    b1, b2 = st.columns(2)
     rec = review_rec
     title = row.title or str(rec.get("title") or "")
     category = row.category or title_case_category(str(rec.get("category") or ""))
-    prompt1_text = str(rec.get("prompt1_text") or default_prompt_for_category(PROMPT_1, category))
-    prompt2_text = str(rec.get("prompt2_text") or default_prompt_for_category(PROMPT_2, category))
     gen_ctx = product_generation_context(title=title, category=category)
+
+    with st.expander("Edit prompts", expanded=False):
+        prompt1_text = st.text_area(
+            "Prompt 1",
+            value=str(rec.get("prompt1_text") or default_prompt_for_category(PROMPT_1, category)),
+            height=150,
+            key=f"gallery_search_p1text::{sku}",
+        )
+        prompt2_text = st.text_area(
+            "Prompt 2",
+            value=str(rec.get("prompt2_text") or default_prompt_for_category(PROMPT_2, category)),
+            height=150,
+            key=f"gallery_search_p2text::{sku}",
+        )
+
+    b1, b2 = st.columns(2)
     with b1:
         if st.button("Regen p1", key=f"gallery_search_rp1::{sku}", disabled=not ref_paths):
             _regenerate_prompt_for_sku(
@@ -1159,6 +1189,16 @@ def _render_gallery_sku_detail(
         st.success(regen_msg)
 
     _render_gallery_media_sections(media_idx, compact=False)
+
+    with st.expander("Upload raw image", expanded=False):
+        up = st.file_uploader(
+            "Add a raw reference image",
+            type=["jpg", "jpeg", "png", "webp"],
+            key=f"gallery_search_raw_upload::{sku}",
+        )
+        if up is not None:
+            dest = _save_uploaded_raw(cfg, sku, up)
+            st.success(f"Saved as `{dest.name}` — refresh the page to see it.")
 
     with st.expander("Details", expanded=False):
         st.write(row.readiness)
@@ -1182,8 +1222,6 @@ def _render_gallery_card(
     category = row.category or title_case_category(str(rec.get("category") or ""))
     description = row.description or str(rec.get("description") or "")
     tags = str(rec.get("tags") or "")
-    prompt1_text = str(rec.get("prompt1_text") or default_prompt_for_category(PROMPT_1, category))
-    prompt2_text = str(rec.get("prompt2_text") or default_prompt_for_category(PROMPT_2, category))
     product_id = row.product_id or str((shop_prod or {}).get("id") or "")
     gen_ctx = product_generation_context(title=title, category=category)
 
@@ -1223,6 +1261,20 @@ def _render_gallery_card(
     with s4:
         st.caption(f"**Sheet** {'✓' if row.in_sheet else '✗'}")
 
+    with st.expander("Edit prompts", expanded=False):
+        prompt1_text = st.text_area(
+            "Prompt 1",
+            value=str(rec.get("prompt1_text") or default_prompt_for_category(PROMPT_1, category)),
+            height=120,
+            key=f"gallery_rp1text::{sku}",
+        )
+        prompt2_text = st.text_area(
+            "Prompt 2",
+            value=str(rec.get("prompt2_text") or default_prompt_for_category(PROMPT_2, category)),
+            height=120,
+            key=f"gallery_rp2text::{sku}",
+        )
+
     b1, b2 = st.columns(2)
     with b1:
         if st.button("Regen p1", key=f"gallery_rp1::{sku}", disabled=not ref_paths):
@@ -1244,6 +1296,16 @@ def _render_gallery_card(
         st.success(regen_msg)
 
     _render_gallery_media_sections(media_idx, compact=True)
+
+    with st.expander("Upload raw image", expanded=False):
+        up = st.file_uploader(
+            "Add a raw reference image",
+            type=["jpg", "jpeg", "png", "webp"],
+            key=f"gallery_raw_upload::{sku}",
+        )
+        if up is not None:
+            dest = _save_uploaded_raw(cfg, sku, up)
+            st.success(f"Saved as `{dest.name}` — refresh the page to see it.")
 
     with st.expander("Details", expanded=False):
         st.write(row.readiness)
